@@ -1,0 +1,292 @@
+import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { TextField, Box, Checkbox, FormControlLabel, Typography } from "@mui/material";
+import { useGlobalInfoStore } from "../../../context/globalInfo";
+import { getStoredRecording, updateRecording } from "../../../api/storage";
+import { WhereWhatPair } from "maxun-core";
+import { getUserById } from "../../../api/auth";
+import { RobotConfigPage } from "./RobotConfigPage";
+import { useNavigate, useLocation } from "react-router-dom";
+import { OutputFormats } from "../../../constants/outputFormats";
+
+interface RobotMeta {
+  name: string;
+  id: string;
+  createdAt: string;
+  pairs: number;
+  updatedAt: string;
+  params: any[];
+  type?: 'extract' | 'scrape' | 'crawl' | 'search' | 'doc-extract' | 'doc-parse';
+  url?: string;
+  formats?: OutputFormats[];
+  isLLM?: boolean;
+  prompt?: string;
+  compareRuns?: boolean;
+}
+
+interface RobotWorkflow {
+  workflow: WhereWhatPair[];
+}
+
+interface ScheduleConfig {
+  runEvery: number;
+  runEveryUnit: "MINUTES" | "HOURS" | "DAYS" | "WEEKS" | "MONTHS";
+  startFrom:
+  | "SUNDAY"
+  | "MONDAY"
+  | "TUESDAY"
+  | "WEDNESDAY"
+  | "THURSDAY"
+  | "FRIDAY"
+  | "SATURDAY";
+  atTimeStart?: string;
+  atTimeEnd?: string;
+  timezone: string;
+  lastRunAt?: Date;
+  nextRunAt?: Date;
+  cronExpression?: string;
+}
+
+export interface RobotSettings {
+  id: string;
+  userId?: number;
+  recording_meta: RobotMeta;
+  recording: RobotWorkflow;
+  google_sheet_email?: string | null;
+  google_sheet_name?: string | null;
+  google_sheet_id?: string | null;
+  google_access_token?: string | null;
+  google_refresh_token?: string | null;
+  schedule?: ScheduleConfig | null;
+}
+
+interface RobotSettingsProps {
+  handleStart: (settings: RobotSettings) => void;
+}
+
+export const RobotSettingsPage = ({ handleStart }: RobotSettingsProps) => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [robot, setRobot] = useState<RobotSettings | null>(null);
+  const [compareRuns, setCompareRuns] = useState(false);
+  const [compareRunsSaving, setCompareRunsSaving] = useState(false);
+  const compareRunsRequestId = useRef(0);
+  const { recordingId, notify } = useGlobalInfoStore();
+
+  console.log("robot recording", robot?.recording_meta);
+
+  useEffect(() => {
+    getRobot();
+  }, []);
+
+  const getRobot = async () => {
+    if (recordingId) {
+      try {
+        const robot = await getStoredRecording(recordingId);
+        setRobot(robot);
+        setCompareRuns(!!robot?.recording_meta?.compareRuns);
+      } catch (error) {
+        notify("error", t("robot_settings.errors.robot_not_found"));
+      }
+    } else {
+      notify("error", t("robot_settings.errors.robot_not_found"));
+    }
+  };
+
+  const getTargetUrl = () => {
+    let url = robot?.recording_meta.url;
+
+    if (!url) {
+      const lastPair =
+        robot?.recording.workflow[robot?.recording.workflow.length - 1];
+      url = lastPair?.what.find((action) => action.action === "goto")
+        ?.args?.[0];
+    }
+
+    return url;
+  };
+
+  const handleCompareRunsToggle = async (checked: boolean) => {
+    if (!robot) return;
+    const requestId = compareRunsRequestId.current + 1;
+    compareRunsRequestId.current = requestId;
+    const previousValue = compareRuns;
+
+    setCompareRuns(checked);
+    setCompareRunsSaving(true);
+
+    try {
+      const success = await updateRecording(robot.recording_meta.id, { compareRuns: checked });
+      if (compareRunsRequestId.current !== requestId) return;
+
+      if (!success) {
+        notify("error", t("robot_settings.errors.update_failed"));
+        setCompareRuns(previousValue);
+        return;
+      }
+
+      setRobot({
+        ...robot,
+        recording_meta: {
+          ...robot.recording_meta,
+          compareRuns: checked,
+        },
+      });
+    } catch (error) {
+      if (compareRunsRequestId.current === requestId) {
+        notify("error", t("robot_settings.errors.update_failed"));
+        setCompareRuns(previousValue);
+      }
+    } finally {
+      if (compareRunsRequestId.current === requestId) {
+        setCompareRunsSaving(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    const fetchUserEmail = async () => {
+      if (robot && robot.userId) {
+        try {
+          const userData = await getUserById(robot.userId.toString());
+          if (userData && userData.user) {
+            setUserEmail(userData.user.email);
+          }
+        } catch (error) {
+          console.error("Failed to fetch user email:", error);
+        }
+      }
+    };
+    fetchUserEmail();
+  }, [robot?.userId]);
+
+  const targetUrl = getTargetUrl();
+  const isAgentRobot = robot?.recording_meta?.isLLM === true;
+
+  return (
+    <RobotConfigPage
+      title={t("robot_settings.title")}
+      cancelButtonText={t("robot_settings.buttons.close")}
+      showSaveButton={false}
+      showCancelButton={false}
+    >
+      <>
+        <Box style={{ display: "flex", flexDirection: "column" }}>
+          {robot && (
+            <>
+              {!['search', 'doc-parse', 'doc-extract'].includes(robot.recording_meta.type || '') && !isAgentRobot && (
+                <TextField
+                  label={t("robot_settings.target_url")}
+                  key="Target URL"
+                  value={targetUrl}
+                  InputProps={{
+                    readOnly: true,
+                  }}
+                  style={{ marginBottom: "20px" }}
+                />
+              )}
+              <TextField
+                label={t("robot_settings.robot_id")}
+                key="Robot ID"
+                value={robot.recording_meta.id}
+                InputProps={{
+                  readOnly: true,
+                }}
+                style={{ marginBottom: "20px" }}
+              />
+              {(() => {
+                let listCounter = 1;
+
+                return robot.recording.workflow.flatMap((wf, wfIndex) =>
+                  wf.what.flatMap((action, actionIndex) => {
+                    const argsWithLimit = action.args?.filter(
+                      (arg: any) => arg && typeof arg === "object" && arg.limit !== undefined
+                    );
+
+                    if (!argsWithLimit?.length) return [];
+
+                    return argsWithLimit.map((arg, limitIndex) => {
+                      const labelName = action.name || `List ${listCounter++}`;
+                      return (
+                        !isAgentRobot && (
+                        <TextField
+                          key={`limit-${wfIndex}-${actionIndex}-${limitIndex}`}
+                          label={`${t("robot_settings.robot_limit")} (${labelName})`}
+                          type="number"
+                          value={arg.limit || ""}
+                          InputProps={{
+                            readOnly: true,
+                          }}
+                          style={{ marginBottom: "20px" }}
+                        />
+                        )
+                      );
+                    });
+                  })
+                );
+              })()}
+
+              {robot.recording_meta.isLLM && robot.recording_meta.prompt && (
+                <TextField
+                  label={t("robot_settings.agent_prompt", { defaultValue: "Prompt" })}
+                  key="Prompt"
+                  value={robot.recording_meta.prompt}
+                  multiline
+                  minRows={2}
+                  maxRows={10}
+                  InputProps={{
+                    readOnly: true,
+                  }}
+                  style={{ marginBottom: "20px" }}
+                />
+              )}
+
+              <TextField
+                label={t("robot_settings.created_by_user")}
+                key="Created By User"
+                value={userEmail ? userEmail : ""}
+                InputProps={{
+                  readOnly: true,
+                }}
+                style={{ marginBottom: "20px" }}
+              />
+              <TextField
+                label={t("robot_settings.created_at")}
+                key="Robot Created At"
+                value={robot.recording_meta.createdAt}
+                InputProps={{
+                  readOnly: true,
+                }}
+                style={{ marginBottom: "20px" }}
+              />
+              {(robot.recording_meta.type === 'scrape' || robot.recording_meta.type === 'extract') && (
+                <>
+                  <Typography variant="h6">Monitoring</Typography>
+                  <p>When enabled, each run is compared against the previous run to detect changes. {''} 
+                    <a href="https://docs.maxun.dev/monitoring" target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none" }}>
+                      Learn more
+                    </a>
+                    .
+                  </p>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={compareRuns}
+                        disabled={compareRunsSaving}
+                        onChange={(e) => handleCompareRunsToggle(e.target.checked)}
+                      />
+                    }
+                    label={t("robot_settings.compare_runs")}
+                    style={{ marginBottom: "20px" }}
+                  />
+                </>
+              )}
+            </>
+          )}
+        </Box>
+      </>
+    </RobotConfigPage>
+  );
+};

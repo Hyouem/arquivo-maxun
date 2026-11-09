@@ -1,0 +1,2057 @@
+import { Router, Request, Response } from 'express';
+import { requireAPIKey } from "../middlewares/api";
+import Robot from "../models/Robot";
+import Run from "../models/Run";
+import { getDecryptedProxyConfig } from "../routes/proxy";
+import { v4 as uuid } from "uuid";
+import { createRemoteBrowserForRun, destroyRemoteBrowser } from "../browser-management/controller";
+import logger from "../logger";
+import { browserPool, io as serverIo } from "../server";
+import { BinaryOutputService } from "../storage/mino";
+import { AuthenticatedRequest } from "../routes/record"
+import {capture} from "../utils/analytics";
+import { Page } from "playwright-core";
+import { WorkflowFile } from "maxun-core";
+import { addGoogleSheetUpdateTask, processGoogleSheetUpdates } from "../workflow-management/integrations/gsheet";
+import { addAirtableUpdateTask, processAirtableUpdates } from "../workflow-management/integrations/airtable";
+import { sendWebhook } from "../routes/webhook";
+import { convertPageToHTML, convertPageToLinks, convertPageToMarkdown, convertPageToScreenshot, convertPageToText } from '../markdownify/scrape';
+import { safeDecrypt } from '../utils/auth';
+import { mintInternalSocketToken } from '../socket-connection/socketAuth';
+import { executeBrowserAgent } from '../sdk/browserAgent';
+import { OutputFormats } from '../constants/output-formats';
+import { processRobotOutputFormats } from '../utils/output-post-processor';
+import { addJob } from '../storage/graphileWorker';
+import { QUEUE_NAMES } from '../task-runner';
+import { computeNextRun, buildCronExpression, ScheduleValidationError } from '../utils/schedule';
+import { compareExtractRunWithPrevious, compareRunOutputsWithPrevious } from '../utils/run-comparison';
+import { withSnakeCaseCapturedKeys } from "../../../src/helpers/jsonKeys";
+
+const router = Router();
+
+const normalizeRobotUrl = (rawUrl: string): string => {
+    let normalizedUrl: URL;
+    try {
+        normalizedUrl = new URL(rawUrl.trim());
+    } catch {
+        throw new Error(`"${rawUrl.trim()}" is not a valid URL. Provide a full web address like https://example.com`);
+    }
+    if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
+        throw new Error(`Unsupported URL protocol "${normalizedUrl.protocol}//" — only http and https are supported. Local file paths cannot be scraped.`);
+    }
+
+    const hostname = normalizedUrl.hostname;
+    const isPlausibleHost = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(hostname)
+        || hostname === 'localhost'
+        || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)
+        || /^\[[0-9a-f:]+\]$/i.test(hostname);
+    if (!isPlausibleHost) {
+        throw new Error(`"${hostname}" is not a reachable hostname. Provide a full web address like https://example.com`);
+    }
+
+    normalizedUrl.search = normalizedUrl.searchParams.toString();
+    return normalizedUrl.toString();
+};
+
+const getRobotTargetUrl = (recording: any): string => {
+    const metaUrl = recording?.recording_meta?.url?.trim();
+    if (metaUrl) {
+        return metaUrl;
+    }
+
+    const workflow = recording?.recording?.workflow || [];
+    const entryPair = [...workflow].reverse().find((pair: any) =>
+        pair?.what?.some((action: any) => action.action === 'goto' && typeof action.args?.[0] === 'string' && action.args[0] !== 'about:blank')
+    );
+    const gotoUrl = entryPair?.what?.find((action: any) => action.action === 'goto' && typeof action.args?.[0] === 'string')?.args?.[0]?.trim();
+    if (gotoUrl) {
+        return gotoUrl;
+    }
+
+    const firstWorkflowUrl = workflow.find((pair: any) => typeof pair?.where?.url === 'string' && pair.where.url !== 'about:blank')?.where?.url?.trim();
+    return firstWorkflowUrl || '';
+};
+
+const formatRecording = (recordingData: any) => {
+    const recordingMeta = recordingData.recording_meta;
+    const workflow = recordingData.recording.workflow || [];
+    const firstWorkflowStep = recordingMeta.url || workflow[workflow.length - 1]?.where?.url || '';
+
+    const inputParameters = [
+        {
+            type: "string",
+            name: "originUrl",
+            label: "Origin URL",
+            required: true,
+            defaultValue: firstWorkflowStep,
+        },
+    ];
+
+    return {
+        id: recordingMeta.id,
+        name: recordingMeta.name,
+        createdAt: new Date(recordingMeta.createdAt).getTime(),
+        inputParameters,
+    };
+};
+
+/**
+ * @swagger
+ * /api/robots:
+ *   get:
+ *     summary: Get all robots
+ *     description: Retrieve a list of all robots.
+ *     tags:
+ *       - Robots
+ *     security:
+ *       - api_key: []
+ *     responses:
+ *       200:
+ *         description: A list of robots.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 200
+ *                 messageCode:
+ *                   type: string
+ *                   example: success
+ *                 robots:
+ *                   type: object
+ *                   properties:
+ *                     totalCount:
+ *                       type: integer
+ *                       example: 5
+ *                     items:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             example: "12345"
+ *                           name:
+ *                             type: string
+ *                             example: "Sample Robot"
+ *       500:
+ *         description: Error retrieving robots.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 500
+ *                 messageCode:
+ *                   type: string
+ *                   example: error
+ *                 message:
+ *                   type: string
+ *                   example: "Failed to retrieve robots"
+ */
+router.get("/robots", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const robots = await Robot.findAll({ raw: true });
+        const formattedRecordings = robots.map(formatRecording);
+
+        const response = {
+            statusCode: 200,
+            messageCode: "success",
+            robots: {
+                totalCount: formattedRecordings.length,
+                items: formattedRecordings,
+            },
+        };
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error("Error fetching robots:", error);
+        res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to retrieve robots",
+        });
+    }
+});
+
+
+const formatRecordingById = (recordingData: any) => {
+    const recordingMeta = recordingData.recording_meta;
+    const workflow = recordingData.recording.workflow || [];
+    const firstWorkflowStep = recordingMeta.url || workflow[workflow.length - 1]?.where?.url || '';
+
+    const inputParameters = [
+        {
+            type: "string",
+            name: "originUrl",
+            label: "Origin URL",
+            required: true,
+            defaultValue: firstWorkflowStep,
+        },
+    ];
+
+    return {
+        id: recordingMeta.id,
+        name: recordingMeta.name,
+        createdAt: new Date(recordingMeta.createdAt).getTime(),
+        inputParameters,
+    };
+};
+
+/**
+ * @swagger
+ * /api/robots/{id}:
+ *   get:
+ *     summary: Get robot by ID
+ *     description: Retrieve a robot by its ID.
+ *     tags:
+ *       - Robots
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot to retrieve.
+ *     responses:
+ *       200:
+ *         description: Robot details.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 200
+ *                 messageCode:
+ *                   type: string
+ *                   example: success
+ *                 robot:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       example: "12345"
+ *                     name:
+ *                       type: string
+ *                       example: "Sample Robot"
+ *       404:
+ *         description: Robot not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 404
+ *                 messageCode:
+ *                   type: string
+ *                   example: not_found
+ *                 message:
+ *                   type: string
+ *                   example: "Recording with ID not found."
+ */
+router.get("/robots/:id", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const robot = await Robot.findOne({
+            where: {
+                'recording_meta.id': req.params.id
+            },
+            raw: true
+        });
+
+        const formattedRecording = formatRecordingById(robot);
+
+        const response = {
+            statusCode: 200,
+            messageCode: "success",
+            robot: formattedRecording,
+        };
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error("Error fetching robot:", error);
+        res.status(404).json({
+            statusCode: 404,
+            messageCode: "not_found",
+            message: `Robot with ID "${req.params.id}" not found.`,
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/runs:
+ *   get:
+ *     summary: Get all runs for a robot
+ *     description: Retrieve all runs associated with a specific robot.
+ *     tags:
+ *       - Runs
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *     responses:
+ *       200:
+ *         description: A list of runs for the robot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 200
+ *                 messageCode:
+ *                   type: string
+ *                   example: success
+ *                 runs:
+ *                   type: object
+ *                   properties:
+ *                     totalCount:
+ *                       type: integer
+ *                       example: 5
+ *                     items:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           runId:
+ *                             type: string
+ *                             example: "67890"
+ *                           status:
+ *                             type: string
+ *                             example: "completed"
+ *       500:
+ *         description: Error retrieving runs.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 500
+ *                 messageCode:
+ *                   type: string
+ *                   example: error
+ *                 message:
+ *                   type: string
+ *                   example: "Failed to retrieve runs"
+ */
+router.get("/robots/:id/runs",requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const runs = await Run.findAll({
+            where: {
+                robotMetaId: req.params.id
+            },
+            raw: true
+        });
+
+        const formattedRuns = runs.map(formatRunResponse);
+
+        const response = {
+            statusCode: 200,
+            messageCode: "success",
+            runs: {
+                totalCount: formattedRuns.length,
+                items: formattedRuns,
+            },
+        };
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error("Error fetching runs:", error);
+        res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to retrieve runs",
+        });
+    }
+}
+);
+
+
+function formatRunResponse(run: any) {
+    const formattedRun = {
+        id: run.id,
+        status: run.status,
+        name: run.name,
+        robotId: run.robotMetaId,
+        startedAt: run.startedAt,
+        finishedAt: run.finishedAt,
+        runId: run.runId,
+        runByUserId: run.runByUserId,
+        runByScheduleId: run.runByScheduleId,
+        runByAPI: run.runByAPI,
+        runBySDK: run.runBySDK,
+        runByMCP: run.runByMCP,
+        runByCLI: run.runByCLI,
+        hasChanges: !!run.hasChanges,
+        changedFormats: run.serializableOutput?._comparison?.changedFormats || [],
+        data: {
+            textData: {},
+            listData: {},
+            crawlData: {},
+            searchData: {},
+            markdown: '',
+            html: '',
+            links: [] as string[],
+            summary: null as string | null,
+            promptResult: null as any
+        },
+        screenshots: [] as any[],
+    };
+
+    const output = run.serializableOutput || {};
+
+    if (output.scrapeSchema && typeof output.scrapeSchema === 'object') {
+        formattedRun.data.textData = withSnakeCaseCapturedKeys(output.scrapeSchema);
+    }
+
+    if (output.scrapeList && typeof output.scrapeList === 'object') {
+        formattedRun.data.listData = withSnakeCaseCapturedKeys(output.scrapeList);
+    }
+
+    if (output.crawl && typeof output.crawl === 'object') {
+        formattedRun.data.crawlData = output.crawl;
+    }
+
+    if (output.search && typeof output.search === 'object') {
+        formattedRun.data.searchData = output.search;
+    }
+
+    if (output.markdown && Array.isArray(output.markdown)) {
+        formattedRun.data.markdown = output.markdown[0]?.content || '';
+    }
+
+    if (output.html && Array.isArray(output.html)) {
+        formattedRun.data.html = output.html[0]?.content || '';
+    }
+
+    if (output.summary && Array.isArray(output.summary) && output.summary.length > 0) {
+        formattedRun.data.summary = output.summary[0]?.content || null;
+    }
+
+    if (output.promptResult && Array.isArray(output.promptResult)) {
+        formattedRun.data.promptResult = output.promptResult[0]?.content || null;
+    }
+
+    if (run.binaryOutput) {
+        Object.keys(run.binaryOutput).forEach(key => {
+            if (run.binaryOutput[key]) {
+                formattedRun.screenshots.push(run.binaryOutput[key]);
+            }
+        });
+    }
+
+    return formattedRun;
+}
+
+
+/**
+ * @swagger
+ * /api/robots/{id}/runs/{runId}:
+ *   get:
+ *     summary: Get a specific run by ID for a robot
+ *     description: Retrieve details of a specific run by its ID.
+ *     tags:
+ *       - Runs
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *       - in: path
+ *         name: runId
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the run.
+ *     responses:
+ *       200:
+ *         description: Run details.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 200
+ *                 messageCode:
+ *                   type: string
+ *                   example: success
+ *                 run:
+ *                   type: object
+ *                   properties:
+ *                     runId:
+ *                       type: string
+ *                       example: "67890"
+ *                     status:
+ *                       type: string
+ *                       example: "completed"
+ *       404:
+ *         description: Run not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 404
+ *                 messageCode:
+ *                   type: string
+ *                   example: not_found
+ *                 message:
+ *                   type: string
+ *                   example: "Run with id not found."
+ */
+router.get("/robots/:id/runs/:runId", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const run = await Run.findOne({
+            where: {
+                runId: req.params.runId,
+                robotMetaId: req.params.id,
+            },
+            raw: true
+        });
+
+        const response = {
+            statusCode: 200,
+            messageCode: "success",
+            run: formatRunResponse(run),
+        };
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error("Error fetching run:", error);
+        res.status(404).json({
+            statusCode: 404,
+            messageCode: "not_found",
+            message: `Run with id "${req.params.runId}" for robot with id "${req.params.id}" not found.`,
+        });
+    }
+});
+
+async function createWorkflowAndStoreMetadata(id: string, userId: string, runSource: 'api' | 'sdk' | 'mcp' | 'cli', requestedFormats?: OutputFormats[], promptInstructions?: string) {
+    try {
+        const recording = await Robot.findOne({
+            where: {
+                'recording_meta.id': id
+            },
+            raw: true
+        });
+
+        if (!recording || !recording.recording_meta || !recording.recording_meta.id) {
+            return {
+                success: false,
+                error: 'Recording not found'
+            };
+        }
+
+        const robotType = (recording.recording_meta as any).type || (recording.recording_meta as any).robotType;
+        const isDocRobot = robotType === 'doc-extract' || robotType === 'doc-parse';
+
+        const proxyConfig = await getDecryptedProxyConfig(userId);
+        let proxyOptions: any = {};
+
+        if (proxyConfig.proxy_url) {
+            proxyOptions = {
+                server: proxyConfig.proxy_url,
+                ...(proxyConfig.proxy_username && proxyConfig.proxy_password && {
+                    username: proxyConfig.proxy_username,
+                    password: proxyConfig.proxy_password,
+                }),
+            };
+        }
+
+        const browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId);
+
+        const runId = uuid();
+
+        const run = await Run.create({
+            status: 'running',
+            name: recording.recording_meta.name,
+            robotId: recording.id,
+            robotMetaId: recording.recording_meta.id,
+            startedAt: new Date().toLocaleString(),
+            finishedAt: '',
+            browserId,
+            interpreterSettings: { maxConcurrency: 1, maxRepeats: 1, debug: true, formats: requestedFormats, promptInstructions, ...(isDocRobot && { robotType }) },
+            log: '',
+            runId,
+            runByUserId: userId,
+            runByAPI: runSource === 'api',
+            runBySDK: runSource === 'sdk',
+            runByMCP: runSource === 'mcp',
+            runByCLI: runSource === 'cli',
+            serializableOutput: {},
+            binaryOutput: {},
+            retryCount: 0
+        });
+
+        const plainRun = run.toJSON();
+
+        try {
+            const runStartedData = {
+                runId: plainRun.runId,
+                robotMetaId: plainRun.robotMetaId,
+                robotName: plainRun.name,
+                status: 'running',
+                startedAt: plainRun.startedAt,
+                runByUserId: plainRun.runByUserId,
+                runByScheduleId: plainRun.runByScheduleId,
+                runByAPI: plainRun.runByAPI || false,
+                browserId: plainRun.browserId
+            };
+            
+            serverIo.of('/queued-run').to(`user-${userId}`).emit('run-started', runStartedData);
+            logger.log('info', `API run started notification sent for run: ${plainRun.runId} to user-${userId}`);
+        } catch (socketError: any) {
+            logger.log('warn', `Failed to send run-started notification for API run ${plainRun.runId}: ${socketError.message}`);
+        }
+
+        try {
+            await addJob(QUEUE_NAMES.EXECUTE_RUN, {
+                userId,
+                runId: plainRun.runId,
+                browserId,
+            }, {
+                maxAttempts: 1,
+                jobKey: `${QUEUE_NAMES.EXECUTE_RUN}:${plainRun.runId}`,
+            });
+        } catch (queueError: any) {
+            const finishedAt = new Date().toLocaleString();
+            await run.update({
+                status: 'failed',
+                finishedAt,
+                log: `Failed to queue execution job: ${queueError.message}`,
+            });
+
+            try {
+                serverIo.of('/queued-run').to(`user-${userId}`).emit('run-completed', {
+                    runId: plainRun.runId,
+                    robotMetaId: plainRun.robotMetaId,
+                    robotName: plainRun.name,
+                    status: 'failed',
+                    finishedAt,
+                    runByUserId: plainRun.runByUserId,
+                    runByScheduleId: plainRun.runByScheduleId,
+                    runByAPI: plainRun.runByAPI || false,
+                    browserId: plainRun.browserId,
+                    error: `Failed to queue execution job: ${queueError.message}`,
+                });
+            } catch (socketError: any) {
+                logger.log('warn', `Failed to emit queue failure for API run ${plainRun.runId}: ${socketError.message}`);
+            }
+
+            if (!isDocRobot) {
+                try {
+                    await destroyRemoteBrowser(browserId, userId);
+                } catch (cleanupError: any) {
+                    logger.log('warn', `Failed to clean up browser ${browserId} after queue error: ${cleanupError.message}`);
+                }
+            }
+
+            throw queueError;
+        }
+
+        return {
+            browserId,
+            runId: plainRun.runId,
+            isDocRobot,
+        }
+
+    } catch (e) {
+        const { message } = e as Error;
+        logger.log('info', `Error while scheduling a run with id: ${id}`);
+        console.log(`Error scheduling run:`, message);
+        return {
+            success: false,
+            error: message,
+        };
+    }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+}
+
+async function triggerIntegrationUpdates(runId: string, robotMetaId: string): Promise<void> {
+  try {
+    addGoogleSheetUpdateTask(runId, {
+      robotId: robotMetaId,
+      runId: runId,
+      status: 'pending',
+      retries: 5,
+    });
+
+    addAirtableUpdateTask(runId, {
+      robotId: robotMetaId,
+      runId: runId,
+      status: 'pending',
+      retries: 5,
+    });
+
+    withTimeout(processAirtableUpdates(), 65000, 'Airtable update')
+      .catch(err => logger.log('error', `Airtable update error: ${err.message}`));
+
+    withTimeout(processGoogleSheetUpdates(), 65000, 'Google Sheets update')
+      .catch(err => logger.log('error', `Google Sheets update error: ${err.message}`));
+  } catch (err: any) {
+    logger.log('error', `Failed to update integrations for run: ${runId}: ${err.message}`);
+  }
+}
+
+function AddGeneratedFlags(workflow: WorkflowFile) {
+    const copy = JSON.parse(JSON.stringify(workflow));
+    for (let i = 0; i < workflow.workflow.length; i++) {
+      copy.workflow[i].what.unshift({
+        action: 'flag',
+        args: ['generated'],
+      });
+    }
+    return copy;
+};
+
+async function executeRun(id: string, userId: string) {
+    let browser: any = null;
+    
+    try {
+        const run = await Run.findOne({ where: { runId: id } });
+        if (!run) {
+            return {
+                success: false,
+                error: 'Run not found'
+            };
+        }
+
+        const plainRun = run.toJSON();
+
+        if (run.status === 'aborted' || run.status === 'aborting') {
+            logger.log('info', `API Run ${id} has status ${run.status}, skipping execution`);
+            return { success: true };
+        }
+
+        if (run.status === 'queued') {
+            logger.log('info', `API Run ${id} has status 'queued', skipping stale execution - will be handled by recovery`);
+            return { success: true };
+        }
+
+        const retryCount = plainRun.retryCount || 0;
+        if (retryCount >= 3) {
+            logger.log('warn', `API Run ${id} has exceeded max retries (${retryCount}/3), marking as failed`);
+            await run.update({
+                status: 'failed',
+                finishedAt: new Date().toLocaleString(),
+                log: `Max retries exceeded (${retryCount}/3) - Run permanently failed`
+            });
+            return { success: false, error: 'Max retries exceeded' };
+        }
+        const requestedFormats = run.interpreterSettings.formats;
+        const promptInstructionsOverride = run.interpreterSettings.promptInstructions;
+
+        const recording = await Robot.findOne({ where: { 'recording_meta.id': plainRun.robotMetaId }, raw: true });
+        if (!recording) {
+            return {
+                success: false,
+                error: 'Recording not found'
+            };
+        }
+
+        browser = browserPool.getRemoteBrowser(plainRun.browserId);
+        if (!browser) {
+            throw new Error('Could not access browser');
+        }
+
+        let currentPage = await browser.getCurrentPage();
+        if (!currentPage) {
+            throw new Error('Could not create a new page');
+        }
+
+        const robotType = (recording.recording_meta as any)?.type || (recording.recording_meta as any)?.robotType || 'extract';
+
+        if (robotType === 'scrape') {
+            logger.log('info', `Executing scrape robot for API run ${id}`);
+
+            const rawFormats = recording.recording_meta.formats;
+            let formats = rawFormats && rawFormats.length > 0 ? rawFormats : ['markdown'];
+
+            if (requestedFormats && Array.isArray(requestedFormats) && requestedFormats.length > 0) {
+                formats = requestedFormats.filter((f): f is 'text' | 'markdown' | 'html' | 'links' | 'screenshot-visible' | 'screenshot-fullpage' | 'summary' =>
+                    ['text', 'markdown', 'html', 'links', 'screenshot-visible', 'screenshot-fullpage', 'summary'].includes(f)
+                );
+            }
+
+            await run.update({
+                status: 'running',
+                log: `Converting page to: ${formats.join(', ')}`
+            });
+
+            try {
+                const url = getRobotTargetUrl(recording);
+                if (!url) {
+                    throw new Error('No URL specified for markdown robot');
+                }
+
+                let markdown = '';
+                let html = '';
+                let text = '';
+                const serializableOutput: any = {};
+                const binaryOutput: any = {};
+
+                const SCRAPE_TIMEOUT = 120000;
+
+                if (formats.includes("screenshot-visible")) {
+                    try {
+                        const screenshotPromise = convertPageToScreenshot(url, currentPage, false);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => reject(new Error(`Screenshot conversion timed out after ${SCRAPE_TIMEOUT / 1000}s`)), SCRAPE_TIMEOUT);
+                        });
+                        const screenshotBuffer = await Promise.race([screenshotPromise, timeoutPromise]);
+
+                        if (screenshotBuffer && screenshotBuffer.length > 0) {
+                            binaryOutput['screenshot-visible'] = {
+                                data: screenshotBuffer.toString('base64'),
+                                mimeType: 'image/png'
+                            };
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Screenshot-visible conversion failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+
+                if (formats.includes("screenshot-fullpage")) {
+                    try {
+                        const screenshotPromise = convertPageToScreenshot(url, currentPage, true);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => reject(new Error(`Screenshot conversion timed out after ${SCRAPE_TIMEOUT / 1000}s`)), SCRAPE_TIMEOUT);
+                        });
+                        const screenshotBuffer = await Promise.race([screenshotPromise, timeoutPromise]);
+
+                        if (screenshotBuffer && screenshotBuffer.length > 0) {
+                            binaryOutput['screenshot-fullpage'] = {
+                                data: screenshotBuffer.toString('base64'),
+                                mimeType: 'image/png'
+                            };
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Screenshot-fullpage conversion failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+              
+                if (formats.includes('text')) {
+                    try {
+                        const textPromise = convertPageToText(url, currentPage);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => reject(new Error(`Text conversion timed out after ${SCRAPE_TIMEOUT / 1000}s`)), SCRAPE_TIMEOUT);
+                        });
+                        text = await Promise.race([textPromise, timeoutPromise]);
+                        if (text && text.trim().length > 0) {
+                            serializableOutput.text = [{ content: text }];
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Text conversion failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+
+                if (formats.includes('markdown') || formats.includes('summary')) {
+                    try {
+                        const markdownPromise = convertPageToMarkdown(url, currentPage);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => reject(new Error(`Markdown conversion timed out after ${SCRAPE_TIMEOUT / 1000}s`)), SCRAPE_TIMEOUT);
+                        });
+                        markdown = await Promise.race([markdownPromise, timeoutPromise]);
+                        if (markdown && markdown.trim().length > 0 && formats.includes('markdown')) {
+                            serializableOutput.markdown = [{ content: markdown }];
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Markdown conversion failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+
+                if (formats.includes('summary')) {
+                    try {
+                        if (!markdown) {
+                            markdown = await Promise.race([
+                                convertPageToMarkdown(url, currentPage),
+                                new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Markdown timed out`)), SCRAPE_TIMEOUT))
+                            ]);
+                        }
+                        if (markdown && markdown.trim().length > 0) {
+                            const { summarizeMarkdown } = require('../utils/summarizer');
+                            const llmConfig = {
+                                provider: ((recording.recording_meta as any).promptLlmProvider || 'ollama') as 'anthropic' | 'openai' | 'ollama',
+                                model: (recording.recording_meta as any).promptLlmModel as string | undefined,
+                                apiKey: (recording.recording_meta as any).promptLlmApiKey ? safeDecrypt((recording.recording_meta as any).promptLlmApiKey) : undefined,
+                                baseUrl: (recording.recording_meta as any).promptLlmBaseUrl as string | undefined,
+                            };
+                            const summaryText = await summarizeMarkdown(markdown, llmConfig);
+                            serializableOutput.summary = [{ content: summaryText }];
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Summary generation failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+
+                if (formats.includes('html')) {
+                    try {
+                        const htmlPromise = convertPageToHTML(url, currentPage);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => reject(new Error(`HTML conversion timed out after ${SCRAPE_TIMEOUT / 1000}s`)), SCRAPE_TIMEOUT);
+                        });
+                        html = await Promise.race([htmlPromise, timeoutPromise]);
+                        if (html && html.trim().length > 0) {
+                            serializableOutput.html = [{ content: html }];
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `HTML conversion failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+
+                if (formats.includes('links')) {
+                    try {
+                        const links = await Promise.race([
+                            convertPageToLinks(url, currentPage),
+                            new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Links extraction timed out`)), SCRAPE_TIMEOUT))
+                        ]);
+                        if (links && links.length > 0) {
+                            serializableOutput.links = links.map((link: string) => ({ url: link }));
+                        }
+                    } catch (error: any) {
+                        logger.log('warn', `Links extraction failed for API run ${plainRun.runId}: ${error.message}`);
+                    }
+                }
+              
+                const promptInstructions = promptInstructionsOverride || (recording.recording_meta as any).promptInstructions as string | undefined;
+                if (promptInstructions && currentPage) {
+                    try {
+                        const llmConfig = {
+                            provider: ((recording.recording_meta as any).promptLlmProvider || 'ollama') as 'anthropic' | 'openai' | 'ollama',
+                            model: (recording.recording_meta as any).promptLlmModel as string | undefined,
+                            apiKey: (recording.recording_meta as any).promptLlmApiKey ? safeDecrypt((recording.recording_meta as any).promptLlmApiKey) : undefined,
+                            baseUrl: (recording.recording_meta as any).promptLlmBaseUrl as string | undefined,
+                        };
+                        logger.log('info', `Running smart query for API scrape run ${plainRun.runId}`);
+                        const agentResult = await executeBrowserAgent(currentPage, promptInstructions, llmConfig);
+                        serializableOutput.promptResult = [{ content: agentResult.result, steps: agentResult.steps, success: agentResult.success }];
+                        logger.log('info', `Smart query completed for API scrape run ${plainRun.runId}`);
+                    } catch (agentErr: any) {
+                        logger.log('warn', `Smart query failed for API scrape run ${plainRun.runId}: ${agentErr.message}`);
+                        serializableOutput.promptResult = [{ content: `Smart query failed: ${agentErr.message}`, steps: [] }];
+                    }
+                }
+
+                const finishedAt = new Date().toLocaleString();
+                let hasChanges = false;
+                const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
+                if ((recording.recording_meta as any).compareRuns) {
+                    capture('maxun-oss-monitoring-used', { robotType: 'scrape', source: 'api' });
+                    try {
+                        const comparison = await compareRunOutputsWithPrevious(run, serializableOutput);
+                        hasChanges = comparison.hasChanges;
+                        serializableOutput._comparison = {
+                            changedFormats: comparison.changedFormats,
+                        };
+                    } catch (comparisonError: any) {
+                        logger.warn(`Monitoring comparison failed for API scrape run ${plainRun.runId}: ${comparisonError.message}`);
+                    }
+                }
+                let uploadedBinaryOutput: Record<string, string> = {};
+                if (Object.keys(binaryOutput).length > 0) {
+                    uploadedBinaryOutput = await binaryOutputService.uploadAndStoreBinaryOutput(run, binaryOutput);
+                }
+
+                await run.update({
+                    status: 'success',
+                    finishedAt,
+                    log: `${formats.join(', ')} conversion completed successfully`,
+                    serializableOutput,
+                    binaryOutput: uploadedBinaryOutput,
+                    hasChanges,
+                });
+
+                logger.log('info', `Markdown robot execution completed for API run ${id}`);
+
+                try {
+                    const completionData = {
+                        runId: plainRun.runId,
+                        robotMetaId: plainRun.robotMetaId,
+                        robotName: recording.recording_meta.name,
+                        status: 'success',
+                        finishedAt,
+                        hasChanges,
+                    };
+
+                    serverIo
+                        .of('/queued-run')
+                        .to(`user-${userId}`)
+                        .emit('run-completed', completionData);
+                } catch (socketError: any) {
+                    logger.log(
+                        'warn',
+                        `Failed to send run-completed notification for markdown robot run ${id}: ${socketError.message}`
+                    );
+                }
+
+                const webhookPayload: any = {
+                    robot_id: plainRun.robotMetaId,
+                    run_id: plainRun.runId,
+                    robot_name: recording.recording_meta.name,
+                    status: 'success',
+                    started_at: plainRun.startedAt,
+                    finished_at: new Date().toLocaleString(),
+                    metadata: {
+                        browser_id: plainRun.browserId,
+                        user_id: userId,
+                    },
+                };
+
+                if (serializableOutput.markdown) webhookPayload.markdown = markdown;
+                if (serializableOutput.html) webhookPayload.html = html;
+                if (serializableOutput.summary) webhookPayload.summary = serializableOutput.summary[0]?.content || '';
+                if (uploadedBinaryOutput['screenshot-visible']) webhookPayload.screenshot_visible = uploadedBinaryOutput['screenshot-visible'];
+                if (uploadedBinaryOutput['screenshot-fullpage']) webhookPayload.screenshot_fullpage = uploadedBinaryOutput['screenshot-fullpage'];
+
+                try {
+                    await sendWebhook(plainRun.robotMetaId, 'run_completed', webhookPayload);
+                    logger.log(
+                        'info',
+                        `Webhooks sent successfully for markdown robot API run ${plainRun.runId}`
+                    );
+                } catch (webhookError: any) {
+                    logger.log(
+                        'warn',
+                        `Failed to send webhooks for markdown robot run ${plainRun.runId}: ${webhookError.message}`
+                    );
+                }
+
+                capture("maxun-oss-run-created", {
+                    runId: plainRun.runId,
+                    userId: userId,
+                    robotId: recording.recording_meta.id,
+                    robotType: "scrape",
+                    source: "api",
+                    status: "success",
+                    createdAt: new Date().toISOString(),
+                    formats
+                });
+
+                await destroyRemoteBrowser(plainRun.browserId, userId);
+
+                return {
+                    success: true,
+                    interpretationInfo: run.toJSON()
+                };
+            } catch (error: any) {
+                logger.log(
+                    'error',
+                    `${formats.join(', ')} conversion failed for API run ${id}: ${error.message}`
+                );
+
+                await run.update({
+                    status: 'failed',
+                    finishedAt: new Date().toLocaleString(),
+                    log: `${formats.join(', ')} conversion failed: ${error.message}`,
+                });
+
+                try {
+                    const failureData = {
+                        runId: plainRun.runId,
+                        robotMetaId: plainRun.robotMetaId,
+                        robotName: recording.recording_meta.name,
+                        status: 'failed',
+                        finishedAt: new Date().toLocaleString(),
+                        error: error.message
+                    };
+
+                    serverIo
+                        .of('/queued-run')
+                        .to(`user-${userId}`)
+                        .emit('run-completed', failureData);
+                } catch (socketError: any) {
+                    logger.log(
+                        'warn',
+                        `Failed to send run-failed notification for markdown robot run ${id}: ${socketError.message}`
+                    );
+                }
+
+                try {
+                    await sendWebhook(plainRun.robotMetaId, 'run_failed', {
+                        robot_id: plainRun.robotMetaId,
+                        run_id: plainRun.runId,
+                        robot_name: recording.recording_meta.name,
+                        status: 'failed',
+                        finished_at: new Date().toLocaleString(),
+                        error: {
+                            message: error.message,
+                            type: 'ConversionError'
+                        }
+                    });
+                } catch (webhookError: any) {
+                    logger.log('warn', `Failed to send webhook for failed API scrape run ${plainRun.runId}: ${webhookError.message}`);
+                }
+
+                capture("maxun-oss-run-created", {
+                    runId: plainRun.runId,
+                    userId: userId,
+                    robotId: recording.recording_meta.id,
+                    robotType: "scrape",
+                    source: "api",
+                    status: "failed",
+                    createdAt: new Date().toISOString(),
+                    formats
+                });
+
+                await destroyRemoteBrowser(plainRun.browserId, userId);
+
+                throw error;
+            }
+        }
+
+        plainRun.status = 'running';
+
+        const workflow = AddGeneratedFlags(recording.recording);
+
+        browser.interpreter.setRunId(plainRun.runId);
+        
+        const INTERPRETATION_TIMEOUT = 600000;
+
+        const interpretationPromise = browser.interpreter.InterpretRecording(
+            workflow, currentPage, (newPage: Page) => currentPage = newPage, plainRun.interpreterSettings
+        );
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error(`Workflow interpretation timed out after ${INTERPRETATION_TIMEOUT/1000}s`)), INTERPRETATION_TIMEOUT);
+        });
+
+        const interpretationInfo = await Promise.race([interpretationPromise, timeoutPromise]);
+
+        const finalRun = await Run.findByPk(run.id);
+        let categorizedOutput = {
+            crawl: finalRun?.serializableOutput?.crawl || {},
+            search: finalRun?.serializableOutput?.search || {},
+        };
+        let postBinaryOutput: Record<string, any> = { ...(interpretationInfo.binaryOutput || {}) };
+
+        if (robotType === 'crawl' || robotType === 'search') {
+            const outputFormats = run.interpreterSettings?.formats || (recording.recording_meta as any).formats as string[] | undefined;
+            const llmConfig = {
+                provider: ((recording.recording_meta as any).promptLlmProvider || 'ollama') as 'anthropic' | 'openai' | 'ollama',
+                model: (recording.recording_meta as any).promptLlmModel as string | undefined,
+                apiKey: (recording.recording_meta as any).promptLlmApiKey ? safeDecrypt((recording.recording_meta as any).promptLlmApiKey) : undefined,
+                baseUrl: (recording.recording_meta as any).promptLlmBaseUrl as string | undefined,
+            };
+            try {
+                const processedOutput = await processRobotOutputFormats({
+                    robotType,
+                    outputFormats,
+                    categorizedOutput: {
+                        crawl: categorizedOutput.crawl as Record<string, any>,
+                        search: categorizedOutput.search as Record<string, any>,
+                    },
+                    initialBinaryOutput: postBinaryOutput,
+                    llmConfig,
+                });
+                categorizedOutput.crawl = processedOutput.categorizedOutput.crawl;
+                categorizedOutput.search = processedOutput.categorizedOutput.search;
+                postBinaryOutput = processedOutput.binaryOutput;
+
+                await run.update({
+                    serializableOutput: {
+                        ...(finalRun?.serializableOutput || {}),
+                        crawl: categorizedOutput.crawl,
+                        search: categorizedOutput.search,
+                    }
+                });
+            } catch (postProcessError: any) {
+                logger.log('warn', `Output post-processing failed for run ${plainRun.runId}: ${postProcessError.message}`);
+            }
+        }
+
+        const finalSerializableOutput: any = {
+            ...(finalRun?.serializableOutput || {}),
+            crawl: categorizedOutput.crawl,
+            search: categorizedOutput.search,
+        };
+
+        const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
+        let hasChanges = false;
+        if (robotType === 'extract' && (recording.recording_meta as any).compareRuns) {
+            capture('maxun-oss-monitoring-used', { robotType: 'extract', source: 'api' });
+            try {
+                const comparison = await compareExtractRunWithPrevious(run, finalSerializableOutput);
+                hasChanges = comparison.hasChanges;
+                finalSerializableOutput._comparison = {
+                    changedFormats: comparison.changedFormats,
+                };
+            } catch (comparisonError: any) {
+                logger.warn(`Monitoring comparison failed for API extract run ${plainRun.runId}: ${comparisonError.message}`);
+            }
+        }
+        const uploadedBinaryOutput = await binaryOutputService.uploadAndStoreBinaryOutput(run, postBinaryOutput);
+
+        if (browser && browser.interpreter) {
+            await browser.interpreter.clearState();
+        }
+        await destroyRemoteBrowser(plainRun.browserId, userId);
+
+        const updatedRun = await run.update({
+            status: 'success',
+            finishedAt: new Date().toLocaleString(),
+            log: interpretationInfo.log.join('\n'),
+            binaryOutput: uploadedBinaryOutput,
+            serializableOutput: finalSerializableOutput,
+            hasChanges,
+        });
+
+        try {
+            const completionData = {
+                runId: plainRun.runId,
+                robotMetaId: plainRun.robotMetaId,
+                robotName: recording.recording_meta.name,
+                status: 'success',
+                finishedAt: new Date().toLocaleString(),
+                runByUserId: plainRun.runByUserId,
+                runByScheduleId: plainRun.runByScheduleId,
+                runByAPI: plainRun.runByAPI || false,
+                hasChanges,
+                browserId: plainRun.browserId
+            };
+
+            serverIo.of('/queued-run').to(`user-${userId}`).emit('run-completed', completionData);
+            logger.log('info', `API run completed notification sent for run: ${plainRun.runId} to user-${userId}`);
+        } catch (socketError: any) {
+            logger.log('warn', `Failed to send run-completed notification for API run ${plainRun.runId}: ${socketError.message}`);
+        }
+
+        let totalSchemaItemsExtracted = 0;
+        let totalListItemsExtracted = 0;
+        let extractedScreenshotsCount = 0;
+        
+        if (updatedRun) {
+            if (updatedRun.dataValues.serializableOutput) {
+                if (updatedRun.dataValues.serializableOutput.scrapeSchema) {
+                    Object.values(updatedRun.dataValues.serializableOutput.scrapeSchema).forEach((schemaResult: any) => {
+                        if (Array.isArray(schemaResult)) {
+                            totalSchemaItemsExtracted += schemaResult.length;
+                        } else if (schemaResult && typeof schemaResult === 'object') {
+                            totalSchemaItemsExtracted += 1;
+                        }
+                    });
+                }
+                
+                if (updatedRun.dataValues.serializableOutput.scrapeList) {
+                    Object.values(updatedRun.dataValues.serializableOutput.scrapeList).forEach((listResult: any) => {
+                        if (Array.isArray(listResult)) {
+                            totalListItemsExtracted += listResult.length;
+                        }
+                    });
+                }
+            }
+            
+            if (updatedRun.dataValues.binaryOutput) {
+                extractedScreenshotsCount = Object.keys(updatedRun.dataValues.binaryOutput).length;
+            }
+        }
+        
+        const totalRowsExtracted = totalSchemaItemsExtracted + totalListItemsExtracted;
+
+        capture('maxun-oss-run-created',{
+                runId: id,
+                userId: userId,
+                robotId: recording.recording_meta.id,
+                robotType: recording.recording_meta.type || 'extract',
+                source: 'api',
+                createdAt: new Date().toISOString(),
+                status: 'success',
+                totalSchemaItemsExtracted,
+                totalListItemsExtracted,
+                extractedScreenshotsCount,
+                totalRowsExtracted
+            }
+        )
+
+        const parsedOutput =
+            typeof updatedRun.dataValues.serializableOutput === "string"
+                ? JSON.parse(updatedRun.dataValues.serializableOutput)
+                : updatedRun.dataValues.serializableOutput || {};
+
+        const parsedList =
+            typeof parsedOutput.scrapeList === "string"
+                ? JSON.parse(parsedOutput.scrapeList)
+                : parsedOutput.scrapeList || {};
+
+        const parsedSchema =
+            typeof parsedOutput.scrapeSchema === "string"
+                ? JSON.parse(parsedOutput.scrapeSchema)
+                : parsedOutput.scrapeSchema || {};
+                
+        const parsedCrawl =
+            typeof parsedOutput.crawl === "string"
+                ? JSON.parse(parsedOutput.crawl)
+                : parsedOutput.crawl || {};
+
+        const parsedSearch =
+            typeof parsedOutput.search === "string"
+                ? JSON.parse(parsedOutput.search)
+                : parsedOutput.search || {};
+
+        const webhookPayload = {
+            robot_id: plainRun.robotMetaId,
+            run_id: plainRun.runId,
+            robot_name: recording.recording_meta.name,
+            status: "success",
+            started_at: plainRun.startedAt,
+            finished_at: new Date().toLocaleString(),
+            extracted_data: {
+                captured_texts: parsedSchema || {},
+                captured_lists: parsedList || {},
+                crawl_data: parsedCrawl || {},
+                search_data: parsedSearch || {},
+                captured_texts_count: totalSchemaItemsExtracted,
+                captured_lists_count: totalListItemsExtracted,
+                screenshots_count: extractedScreenshotsCount
+            },
+            metadata: {
+                browser_id: plainRun.browserId,
+                user_id: userId,
+            },
+        };
+
+        try {
+            await sendWebhook(plainRun.robotMetaId, 'run_completed', webhookPayload);
+            logger.log('info', `Webhooks sent successfully for completed run ${plainRun.runId}`);
+        } catch (webhookError: any) {
+            logger.log('error', `Failed to send webhooks for run ${plainRun.runId}: ${webhookError.message}`);
+        }
+
+        await triggerIntegrationUpdates(plainRun.runId, plainRun.robotMetaId);
+
+        return {
+            success: true,
+            interpretationInfo: updatedRun.toJSON()
+        };
+
+    } catch (error: any) {
+        logger.log('info', `Error while running a robot with id: ${id} - ${error.message}`);
+        const run = await Run.findOne({ where: { runId: id } });
+        if (run) {
+            if (browser) {
+                try {
+                    if (browser.interpreter) {
+                        await browser.interpreter.clearState();
+                    }
+                    await destroyRemoteBrowser(run.browserId, userId);
+                } catch (cleanupError: any) {
+                    logger.error(`Failed to cleanup browser in error handler: ${cleanupError.message}`);
+                }
+            }
+
+            await run.update({
+                status: 'failed',
+                finishedAt: new Date().toLocaleString(),
+                log: (run.log ? run.log + '\n' : '') + `Error: ${error.message}\n` + (error.stack ? error.stack : ''),
+            });
+
+            try {
+                const recording = await Robot.findOne({ where: { 'recording_meta.id': run.robotMetaId }, raw: true });
+                const failureData = {
+                    runId: run.runId,
+                    robotMetaId: run.robotMetaId,
+                    robotName: recording ? recording.recording_meta.name : 'Unknown Robot',
+                    status: 'failed',
+                    finishedAt: new Date().toLocaleString(),
+                    runByUserId: run.runByUserId,
+                    runByScheduleId: run.runByScheduleId,
+                    runByAPI: run.runByAPI || false,
+                    browserId: run.browserId
+                };
+
+                serverIo.of('/queued-run').to(`user-${userId}`).emit('run-completed', failureData);
+                logger.log('info', `API run permanently failed notification sent for run: ${run.runId} to user-${userId}`);
+            } catch (socketError: any) {
+                logger.log('warn', `Failed to send run-completed notification for permanently failed API run ${run.runId}: ${socketError.message}`);
+            }
+
+            const recording = await Robot.findOne({ where: { 'recording_meta.id': run.robotMetaId }, raw: true });
+
+            const failedWebhookPayload = {
+                robot_id: run.robotMetaId,
+                run_id: run.runId,
+                robot_name: recording ? recording.recording_meta.name : 'Unknown Robot',
+                status: 'failed',
+                started_at: run.startedAt,
+                finished_at: new Date().toLocaleString(),
+                error: {
+                    message: error.message,
+                    stack: error.stack,
+                    type: error.name || 'ExecutionError'
+                },
+                metadata: {
+                    browser_id: run.browserId,
+                    user_id: userId,
+                }
+            };
+
+            try {
+                await sendWebhook(run.robotMetaId, 'run_failed', failedWebhookPayload);
+                logger.log('info', `Failure webhooks sent successfully for run ${run.runId}`);
+            } catch (webhookError: any) {
+                logger.log('error', `Failed to send failure webhooks for run ${run.runId}: ${webhookError.message}`);
+            }
+            capture(
+               'maxun-oss-run-created',
+               {
+                    runId: id,
+                    userId: userId,
+                    robotId: recording?.recording_meta?.id || run.robotMetaId,
+                    robotType: recording?.recording_meta?.type || 'extract',
+                    source: 'api',
+                    createdAt: new Date().toISOString(),
+                    status: 'failed',
+                    is_llm: (recording?.recording_meta as any)?.isLLM,
+                }
+            );
+        }
+        return {
+            success: false,
+            error: error.message,
+        };
+    }
+}
+
+export async function handleRunRecording(id: string, userId: string, runSource: 'api' | 'sdk' | 'mcp' | 'cli' = 'api', requestedFormats?: OutputFormats[], promptInstructions?: string) {
+    try {
+        const result = await createWorkflowAndStoreMetadata(id, userId, runSource, requestedFormats, promptInstructions);
+        const { runId: newRunId, isDocRobot } = result as any;
+
+        if (!newRunId || !userId) {
+            throw new Error('runId or userId is undefined');
+        }
+
+        if (isDocRobot) {
+            logger.log('info', `Doc robot run ${newRunId} queued without browser`);
+        }
+
+        logger.log('info', `Running Robot: ${id}`);
+
+        return newRunId;
+
+    } catch (error: any) {
+        logger.error('Error running robot:', error);
+    }
+}
+
+async function waitForRunCompletion(runId: string, interval: number = 2000) {
+    const MAX_WAIT_TIME = 180 * 60 * 1000;
+    const startTime = Date.now();
+
+    while (true) {
+        if (Date.now() - startTime > MAX_WAIT_TIME) {
+            throw new Error('Run completion timeout after 3 hours');
+        }
+
+        const run = await Run.findOne({ where: { runId } });
+        if (!run) throw new Error('Run not found');
+
+        if (run.status === 'success') {
+            return run.toJSON();
+        } else if (run.status === 'failed') {
+            throw new Error('Run failed');
+        } else if (run.status === 'aborted' || run.status === 'aborting') {
+            throw new Error('Run was aborted');
+        }
+
+        await new Promise(resolve => setTimeout(resolve, interval));
+    }
+}
+
+/**
+ * @swagger
+ * /api/robots/{id}/runs:
+ *   post:
+ *     summary: Run a robot by ID
+ *     description: When you need to run a robot and get its captured data, you can use this endpoint to create a run for the robot. For now, you can poll the GET endpoint to retrieve a run's details as soon as it is finished. We are working on adding a webhook feature to notify you when a run is finished.
+ *     tags:
+ *       - Runs 
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot to run.
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               formats:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   enum: [markdown, html]
+ *                 description: Optional override formats for this run.
+ *           example:
+ *             formats: ['markdown','html','text','links','summary','screenshot-visible','screenshot-fullpage']
+ *     responses:
+ *       200:
+ *         description: Robot run started successfully.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 200
+ *                 messageCode:
+ *                   type: string
+ *                   example: success
+ *                 run:
+ *                   type: object
+ *                   properties:
+ *                     runId:
+ *                       type: string
+ *                       example: "67890"
+ *                     status:
+ *                       type: string
+ *                       example: "in_progress"
+ *       401:
+ *         description: Unauthorized access.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Unauthorized"
+ *       500:
+ *         description: Error running robot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 statusCode:
+ *                   type: integer
+ *                   example: 500
+ *                 messageCode:
+ *                   type: string
+ *                   example: error
+ *                 message:
+ *                   type: string
+ *                   example: "Failed to run robot"
+ */
+router.post("/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({ ok: false, error: 'Unauthorized' });
+        }
+
+        const requestedFormats = req.body?.formats as OutputFormats[] | undefined;
+        const promptInstructions = req.body?.promptInstructions;
+        const runSource = req.headers['x-run-source'] === 'mcp' ? 'mcp' : 'api';
+        const runId = await handleRunRecording(req.params.id, req.user.id, runSource, requestedFormats, promptInstructions);
+
+        if (!runId) {
+            throw new Error('Run ID is undefined');
+        }
+        const completedRun = await waitForRunCompletion(runId);
+
+        const response = {
+            statusCode: 200,
+            messageCode: "success",
+            run: formatRunResponse(completedRun),
+        };
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error("Error running robot:", error);
+        res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to run robot",
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/duplicate:
+ *   post:
+ *     summary: Duplicate a robot with a new target URL
+ *     description: Duplicate an existing robot to run it on a different URL with the same structure.
+ *    tags: 
+ *     - Robots   
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot to duplicate.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - targetUrl
+ *             properties:
+ *               targetUrl:
+ *                 type: string
+ *                 example: "https://www.ycombinator.com/companies/airbnb"
+ *                 description: The new URL to target in the duplicated robot.
+ *     responses:
+ *       201:
+ *         description: Robot duplicated successfully.
+ *       400:
+ *         description: Missing required field.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Internal server error.
+ */
+router.post("/robots/:id/duplicate", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { targetUrl } = req.body;
+
+        if (!targetUrl) {
+            return res.status(400).json({
+                statusCode: 400,
+                messageCode: "bad_request",
+                message: 'The "targetUrl" field is required.',
+            });
+        }
+
+        let normalizedTargetUrl: string;
+        try {
+            normalizedTargetUrl = normalizeRobotUrl(targetUrl);
+        } catch (err) {
+            return res.status(400).json({
+                statusCode: 400,
+                messageCode: "bad_request",
+                message: `Invalid "targetUrl": ${err instanceof Error ? err.message : 'must be a valid URL'}`,
+            });
+        }
+
+        const originalRobot = await Robot.findOne({
+            where: { 'recording_meta.id': id },
+        });
+
+        if (!originalRobot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        const lastWord = normalizedTargetUrl.split('/').filter(Boolean).pop() || 'Unnamed';
+
+        const steps: any[] = originalRobot.recording.workflow;
+        const entryStep = steps.findLast((step: any) => step.where?.url === 'about:blank');
+        const originalEntryUrl: string | null = entryStep?.what?.find(
+            (action: any) => action.action === 'goto' && action.args?.length
+        )?.args?.[0] ?? null;
+
+        let gotoUpdated = false;
+        let whereUpdateStopped = false;
+
+        const workflow = [...steps].reverse().map((step: any) => {
+            let updatedWhere = step.where;
+
+            if (originalEntryUrl && step.where?.url !== 'about:blank' && !whereUpdateStopped) {
+                if (step.where?.url === originalEntryUrl) {
+                    updatedWhere = { ...step.where, url: normalizedTargetUrl };
+                } else {
+                    whereUpdateStopped = true;
+                }
+            }
+
+            const updatedWhat = step.what.map((action: any) => {
+                if (!gotoUpdated && action.action === 'goto' && action.args?.[0] === originalEntryUrl) {
+                    gotoUpdated = true;
+                    return { ...action, args: [normalizedTargetUrl, ...action.args.slice(1)] };
+                }
+                if ((action.action === 'scrape' || action.action === 'crawl') &&
+                    action.args?.[0] && typeof action.args[0] === 'object' &&
+                    action.args[0].url === originalEntryUrl) {
+                    return { ...action, args: [{ ...action.args[0], url: normalizedTargetUrl }, ...action.args.slice(1)] };
+                }
+                return action;
+            });
+
+            return { ...step, where: updatedWhere, what: updatedWhat };
+        }).reverse();
+
+        const currentTimestamp = new Date().toLocaleString();
+
+        const newRobot = await Robot.create({
+            id: uuid(),
+            userId: originalRobot.userId,
+            recording_meta: {
+                ...originalRobot.recording_meta,
+                id: uuid(),
+                name: `${originalRobot.recording_meta.name} (${lastWord})`,
+                url: normalizedTargetUrl,
+                createdAt: currentTimestamp,
+                updatedAt: currentTimestamp,
+            },
+            recording: { ...originalRobot.recording, workflow },
+            google_sheet_email: null,
+            google_sheet_name: null,
+            google_sheet_id: null,
+            google_access_token: null,
+            google_refresh_token: null,
+            airtable_base_id: null,
+            airtable_base_name: null,
+            airtable_table_name: null,
+            airtable_table_id: null,
+            airtable_access_token: null,
+            airtable_refresh_token: null,
+            webhooks: null,
+            schedule: null,
+        });
+
+        logger.log('info', `Robot with ID ${id} duplicated successfully as ${newRobot.id}.`);
+
+        return res.status(201).json({
+            statusCode: 201,
+            messageCode: "success",
+            robot: formatRecordingById(newRobot.toJSON()),
+        });
+    } catch (error) {
+        logger.log('error', `Error duplicating robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: error instanceof Error ? error.message : 'An unknown error occurred.',
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   post:
+ *     summary: Schedule recurring runs for a robot
+ *     description: Create or replace a recurring schedule for a robot. The robot will run automatically based on the provided frequency. Re-posting replaces any existing schedule.
+ *     tags:
+ *      - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot to schedule.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - runEvery
+ *               - runEveryUnit
+ *               - startFrom
+ *               - atTimeStart
+ *               - atTimeEnd
+ *               - timezone
+ *             properties:
+ *               runEvery:
+ *                 type: integer
+ *                 example: 6
+ *                 description: How often the robot runs, in units of runEveryUnit.
+ *               runEveryUnit:
+ *                 type: string
+ *                 enum: [MINUTES, HOURS, DAYS, WEEKS, MONTHS]
+ *                 example: HOURS
+ *               startFrom:
+ *                 type: string
+ *                 enum: [SUNDAY, MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY]
+ *                 example: MONDAY
+ *               atTimeStart:
+ *                 type: string
+ *                 example: "09:00"
+ *                 description: Start time in HH:MM (24h).
+ *               atTimeEnd:
+ *                 type: string
+ *                 example: "17:00"
+ *                 description: End time in HH:MM (24h).
+ *               timezone:
+ *                 type: string
+ *                 example: "UTC"
+ *                 description: IANA timezone name.
+ *               dayOfMonth:
+ *                 type: string
+ *                 example: "1"
+ *                 description: Day of month (only used when runEveryUnit is MONTHS).
+ *     responses:
+ *       200:
+ *         description: Schedule created successfully.
+ *       400:
+ *         description: Invalid schedule parameters.
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error scheduling robot.
+ */
+router.post("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        const { runEvery, runEveryUnit, startFrom, dayOfMonth, atTimeStart, atTimeEnd, timezone } = req.body;
+
+        // Validate inputs and build the cron expression (shared with the dashboard route).
+        let cronExpression: string;
+        try {
+            ({ cronExpression } = buildCronExpression({
+                runEvery, runEveryUnit, startFrom, atTimeStart, atTimeEnd, timezone, dayOfMonth,
+            }));
+        } catch (validationError) {
+            if (validationError instanceof ScheduleValidationError) {
+                return res.status(400).json({
+                    statusCode: 400,
+                    messageCode: "bad_request",
+                    message: validationError.message,
+                    field: validationError.field,
+                });
+            }
+            throw validationError;
+        }
+
+        const nextRunAt = computeNextRun(cronExpression, timezone);
+
+        // Single scoped update. No schedulerClaimedAt key => any stale claim is cleared.
+        await robot.update({
+            schedule: {
+                runEvery,
+                runEveryUnit,
+                startFrom,
+                dayOfMonth,
+                atTimeStart,
+                atTimeEnd,
+                timezone,
+                cronExpression,
+                lastRunAt: undefined,
+                nextRunAt: nextRunAt || undefined,
+            },
+        });
+
+        capture('maxun-oss-robot-scheduled', {
+            robotId: id,
+            user_id: authenticatedReq.user.id,
+            source: 'api',
+            scheduled_at: new Date().toISOString(),
+        });
+
+        logger.log('info', `Scheduled robot ${id} via API (cron: ${cronExpression}, tz: ${timezone}, next: ${nextRunAt})`);
+
+        const updatedRobot = await Robot.findOne({ where: { 'recording_meta.id': id }, raw: true });
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            schedule: updatedRobot?.schedule ?? null,
+        });
+    } catch (error) {
+        logger.log('error', `Error scheduling robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to schedule robot",
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   get:
+ *     summary: Get a robot's schedule
+ *     description: Retrieve the current recurring schedule for a robot, or null if none is set.
+ *     tags: 
+ *      - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *     responses:
+ *       200:
+ *         description: The robot's schedule (or null).
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error retrieving schedule.
+ */
+router.get("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id }, raw: true });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            schedule: robot.schedule ?? null,
+        });
+    } catch (error) {
+        logger.log('error', `Error fetching schedule for robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to retrieve schedule",
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   delete:
+ *     summary: Delete a robot's schedule
+ *     description: Cancel a robot's recurring schedule. Idempotent — succeeds even if the robot has no schedule.
+ *     tags:
+ *       - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *     responses:
+ *       200:
+ *         description: Schedule deleted successfully.
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error deleting schedule.
+ */
+router.delete("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        await robot.update({ schedule: null });
+
+        capture('maxun-oss-robot-schedule-deleted', {
+            robotId: id,
+            user_id: authenticatedReq.user.id,
+            source: 'api',
+            unscheduled_at: new Date().toISOString(),
+        });
+
+        logger.log('info', `Deleted schedule for robot ${id} via API`);
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            message: "Schedule deleted successfully",
+        });
+    } catch (error) {
+        logger.log('error', `Error deleting schedule for robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to delete schedule",
+        });
+    }
+});
+
+
+export default router;

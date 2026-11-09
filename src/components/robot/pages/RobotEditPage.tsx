@@ -1,0 +1,1721 @@
+import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  TextField,
+  Typography,
+  Box,
+  Button,
+  IconButton,
+  InputAdornment,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  FormControlLabel,
+  Checkbox,
+  Collapse,
+  CircularProgress,
+  Divider,
+} from "@mui/material";
+import { Visibility, VisibilityOff } from "@mui/icons-material";
+import { useGlobalInfoStore, useCacheInvalidation } from "../../../context/globalInfo";
+import { getStoredRecording, updateRecording, replaceDocumentFile } from "../../../api/storage";
+import { WhereWhatPair } from "maxun-core";
+import { RobotConfigPage } from "./RobotConfigPage";
+import { useNavigate, useLocation } from "react-router-dom";
+import {
+  DEFAULT_OUTPUT_FORMATS,
+  OUTPUT_FORMAT_LABELS,
+  OUTPUT_FORMAT_OPTIONS,
+  OutputFormats,
+} from "../../../constants/outputFormats";
+
+type LlmProvider = 'anthropic' | 'openai' | 'ollama';
+type OpenAICompatiblePresetId = 'openai' | 'qianfan' | 'openrouter' | 'deepseek' | 'custom';
+
+interface OpenAICompatiblePreset {
+  label: string;
+  baseUrl: string;
+  baseUrlPlaceholder: string;
+  baseUrlHelperText: string;
+  modelPlaceholder: string;
+  modelHelperText: string;
+  apiKeyPlaceholder: string;
+  apiKeyHelperText: string;
+}
+
+const OLLAMA_DEFAULT_BASE_URL = 'http://localhost:11434';
+const OLLAMA_DOCKER_HINT = 'Defaults to http://localhost:11434. Use http://host.docker.internal:11434 if running via Docker';
+const DEFAULT_OPENAI_COMPATIBLE_PRESET_ID: OpenAICompatiblePresetId = 'openai';
+
+const OPENAI_COMPATIBLE_PRESETS: Record<OpenAICompatiblePresetId, OpenAICompatiblePreset> = {
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    baseUrlPlaceholder: 'https://api.openai.com/v1',
+    baseUrlHelperText: 'Override only if your OpenAI-compatible endpoint is different.',
+    modelPlaceholder: 'e.g. gpt-4o',
+    modelHelperText: "Use an OpenAI model, or leave blank to use Maxun's default.",
+    apiKeyPlaceholder: 'OpenAI API key',
+    apiKeyHelperText: 'Use an OpenAI API key. If blank, Maxun falls back to OPENAI_API_KEY on the server.',
+  },
+  qianfan: {
+    label: 'Qianfan / ERNIE',
+    baseUrl: 'https://qianfan.baidubce.com/v2',
+    baseUrlPlaceholder: 'https://qianfan.baidubce.com/v2',
+    baseUrlHelperText: 'Use the Qianfan OpenAI-compatible endpoint, or override it for your account.',
+    modelPlaceholder: 'e.g. ernie-4.5-turbo-128k',
+    modelHelperText: 'Enter an ERNIE model available in your Qianfan account.',
+    apiKeyPlaceholder: 'Qianfan API key',
+    apiKeyHelperText: 'Use a Qianfan API key. If blank, Maxun falls back to OPENAI_API_KEY on the server.',
+  },
+  openrouter: {
+    label: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    baseUrlPlaceholder: 'https://openrouter.ai/api/v1',
+    baseUrlHelperText: 'Use the OpenRouter OpenAI-compatible endpoint, or override it for your account.',
+    modelPlaceholder: 'e.g. openai/gpt-4o-mini',
+    modelHelperText: 'Enter an OpenRouter model id from your enabled models.',
+    apiKeyPlaceholder: 'OpenRouter API key',
+    apiKeyHelperText: 'Use an OpenRouter API key. If blank, Maxun falls back to OPENAI_API_KEY on the server.',
+  },
+  deepseek: {
+    label: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com',
+    baseUrlPlaceholder: 'https://api.deepseek.com',
+    baseUrlHelperText: 'Use the DeepSeek OpenAI-compatible endpoint, or override it for your account.',
+    modelPlaceholder: 'e.g. deepseek-v4-flash',
+    modelHelperText: 'Enter a DeepSeek model, for example deepseek-v4-flash.',
+    apiKeyPlaceholder: 'DeepSeek API key',
+    apiKeyHelperText: 'Use a DeepSeek API key. If blank, Maxun falls back to OPENAI_API_KEY on the server.',
+  },
+  custom: {
+    label: 'Custom',
+    baseUrl: '',
+    baseUrlPlaceholder: 'https://api.example.com/v1',
+    baseUrlHelperText: 'Enter your provider OpenAI-compatible base URL.',
+    modelPlaceholder: 'e.g. provider-model-name',
+    modelHelperText: 'Enter the model name expected by your provider.',
+    apiKeyPlaceholder: 'Provider API key',
+    apiKeyHelperText: 'Use the API key for your OpenAI-compatible provider.',
+  },
+};
+
+const OPENAI_COMPATIBLE_PRESET_IDS: OpenAICompatiblePresetId[] = ['openai', 'qianfan', 'openrouter', 'deepseek', 'custom'];
+
+const getPreset = (id: OpenAICompatiblePresetId) => OPENAI_COMPATIBLE_PRESETS[id];
+
+const getModelPlaceholder = (provider: LlmProvider, presetId: OpenAICompatiblePresetId) => {
+  if (provider === 'ollama') return 'e.g. llama3.2-vision';
+  if (provider === 'anthropic') return 'e.g. claude-sonnet-4-6';
+  return getPreset(presetId).modelPlaceholder;
+};
+
+const getModelHelperText = (provider: LlmProvider, presetId: OpenAICompatiblePresetId) => {
+  if (provider === 'ollama') return 'Leave blank to use default: llama3.2-vision';
+  if (provider === 'anthropic') return 'Leave blank to use default: claude-sonnet-4-6';
+  return getPreset(presetId).modelHelperText;
+};
+
+interface RobotMeta {
+  name: string;
+  id: string;
+  prebuiltId?: string;
+  createdAt: string;
+  pairs: number;
+  updatedAt: string;
+  params: any[];
+  type?: 'extract' | 'scrape' | 'crawl' | 'search' | 'doc-extract' | 'doc-parse';
+  url?: string;
+  formats?: OutputFormats[];
+  isLLM?: boolean;
+  promptInstructions?: string;
+  promptLlmProvider?: LlmProvider;
+  promptLlmModel?: string;
+  promptLlmApiKey?: string;
+  promptLlmBaseUrl?: string;
+}
+
+interface RobotWorkflow {
+  workflow: WhereWhatPair[];
+}
+
+interface ScheduleConfig {
+  runEvery: number;
+  runEveryUnit: "MINUTES" | "HOURS" | "DAYS" | "WEEKS" | "MONTHS";
+  startFrom:
+  | "SUNDAY"
+  | "MONDAY"
+  | "TUESDAY"
+  | "WEDNESDAY"
+  | "THURSDAY"
+  | "FRIDAY"
+  | "SATURDAY";
+  atTimeStart?: string;
+  atTimeEnd?: string;
+  timezone: string;
+  lastRunAt?: Date;
+  nextRunAt?: Date;
+  cronExpression?: string;
+}
+
+export interface RobotSettings {
+  id: string;
+  userId?: number;
+  recording_meta: RobotMeta;
+  recording: RobotWorkflow;
+  google_sheet_email?: string | null;
+  google_sheet_name?: string | null;
+  google_sheet_id?: string | null;
+  google_access_token?: string | null;
+  google_refresh_token?: string | null;
+  schedule?: ScheduleConfig | null;
+}
+
+interface RobotSettingsProps {
+  handleStart: (settings: RobotSettings) => void;
+}
+
+interface CredentialInfo {
+  value: string;
+  type: string;
+}
+
+interface Credentials {
+  [key: string]: CredentialInfo;
+}
+
+interface CredentialVisibility {
+  [key: string]: boolean;
+}
+
+interface GroupedCredentials {
+  passwords: string[];
+  emails: string[];
+  usernames: string[];
+  others: string[];
+}
+
+interface ScrapeListLimit {
+  pairIndex: number;
+  actionIndex: number;
+  argIndex: number;
+  currentLimit: number;
+}
+
+interface CrawlConfig {
+  mode?: string;
+  limit?: number;
+  maxDepth?: number;
+  useSitemap?: boolean;
+  followLinks?: boolean;
+  excludePaths?: string[];
+  includePaths?: string[];
+  respectRobots?: boolean;
+}
+
+interface SearchConfig {
+  mode?: 'discover' | 'scrape';
+  limit?: number;
+  query?: string;
+  filters?: Record<string, any>;
+  provider?: string;
+}
+
+export const RobotEditPage = ({ handleStart }: RobotSettingsProps) => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [credentials, setCredentials] = useState<Credentials>({});
+  const { recordingId, notify, setRerenderRobots } = useGlobalInfoStore();
+  const { invalidateRecordings } = useCacheInvalidation();
+  const [robot, setRobot] = useState<RobotSettings | null>(null);
+  const [credentialGroups, setCredentialGroups] = useState<GroupedCredentials>({
+    passwords: [],
+    emails: [],
+    usernames: [],
+    others: [],
+  });
+  const [showPasswords, setShowPasswords] = useState<CredentialVisibility>({});
+  const [scrapeListLimits, setScrapeListLimits] = useState<ScrapeListLimit[]>(
+    []
+  );
+  const [isLoading, setIsLoading] = useState(false);
+  const [crawlConfig, setCrawlConfig] = useState<CrawlConfig>({});
+  const [searchConfig, setSearchConfig] = useState<SearchConfig>({});
+  const [crawlOutputFormats, setCrawlOutputFormats] = useState<OutputFormats[]>(DEFAULT_OUTPUT_FORMATS);
+  const [searchOutputFormats, setSearchOutputFormats] = useState<OutputFormats[]>(DEFAULT_OUTPUT_FORMATS);
+  const [scrapeOutputFormats, setScrapeOutputFormats] = useState<OutputFormats[]>(DEFAULT_OUTPUT_FORMATS);
+  const [showCrawlAdvanced, setShowCrawlAdvanced] = useState(false);
+  const [replacementFile, setReplacementFile] = useState<File | null>(null);
+  const [isReplacingFile, setIsReplacingFile] = useState(false);
+
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>('ollama');
+  const [llmOpenAIPreset, setLlmOpenAIPreset] = useState<OpenAICompatiblePresetId>(DEFAULT_OPENAI_COMPATIBLE_PRESET_ID);
+  const [llmModel, setLlmModel] = useState('');
+  const [llmApiKey, setLlmApiKey] = useState('');
+  const [llmBaseUrl, setLlmBaseUrl] = useState('');
+  const [showLlmApiKey, setShowLlmApiKey] = useState(false);
+
+  const isEmailPattern = (value: string): boolean => {
+    return value.includes("@");
+  };
+
+  const isUsernameSelector = (selector: string): boolean => {
+    return (
+      selector.toLowerCase().includes("username") ||
+      selector.toLowerCase().includes("user") ||
+      selector.toLowerCase().includes("email")
+    );
+  };
+
+  const determineCredentialType = (
+    selector: string,
+    info: CredentialInfo
+  ): "password" | "email" | "username" | "other" => {
+    if (
+      info.type === "password" ||
+      selector.toLowerCase().includes("password")
+    ) {
+      return "password";
+    }
+    if (
+      isEmailPattern(info.value) ||
+      selector.toLowerCase().includes("email")
+    ) {
+      return "email";
+    }
+    if (isUsernameSelector(selector)) {
+      return "username";
+    }
+    return "other";
+  };
+
+  useEffect(() => {
+    getRobot();
+  }, []);
+
+  useEffect(() => {
+    if (!robot) return;
+
+    if (robot?.recording?.workflow) {
+      const extractedCredentials = extractInitialCredentials(
+        robot.recording.workflow
+      );
+      setCredentials(extractedCredentials);
+      setCredentialGroups(groupCredentialsByType(extractedCredentials));
+
+      findScrapeListLimits(robot.recording.workflow);
+      extractCrawlConfig(robot.recording.workflow);
+      extractSearchConfig(robot.recording.workflow);
+
+      const rawFormats = Array.isArray(robot.recording_meta?.formats)
+        ? robot.recording_meta.formats
+        : [];
+
+      const filteredFormats = rawFormats.filter((format): format is OutputFormats =>
+        OUTPUT_FORMAT_OPTIONS.includes(format as OutputFormats)
+      );
+
+      if (robot.recording_meta?.type === 'crawl') {
+        setCrawlOutputFormats(
+          filteredFormats.length > 0 ? filteredFormats : DEFAULT_OUTPUT_FORMATS
+        );
+      }
+
+      if (robot.recording_meta?.type === 'search') {
+        const isDiscoverMode = robot.recording?.workflow?.some((pair: any) =>
+          (pair.what || []).some(
+            (action: any) =>
+              action.action === 'search' &&
+              action.args?.[0]?.mode === 'discover'
+          )
+        );
+
+        if (isDiscoverMode) {
+          setSearchOutputFormats(filteredFormats);
+        } else {
+          setSearchOutputFormats(
+            filteredFormats.length > 0 ? filteredFormats : DEFAULT_OUTPUT_FORMATS
+          );
+        }
+      }
+
+      if (robot.recording_meta?.type === 'scrape') {
+        setScrapeOutputFormats(
+          filteredFormats.length > 0 ? filteredFormats : DEFAULT_OUTPUT_FORMATS
+        );
+      }
+    }
+
+    const meta = robot.recording_meta;
+    if (meta?.promptLlmProvider) {
+      setLlmProvider(meta.promptLlmProvider);
+      if (meta.promptLlmProvider === 'openai') {
+        setLlmOpenAIPreset(DEFAULT_OPENAI_COMPATIBLE_PRESET_ID);
+        setLlmBaseUrl(meta.promptLlmBaseUrl || getPreset(DEFAULT_OPENAI_COMPATIBLE_PRESET_ID).baseUrl);
+      } else if (meta.promptLlmProvider === 'ollama') {
+        setLlmBaseUrl(meta.promptLlmBaseUrl || '');
+      }
+    }
+    if (meta?.promptLlmModel) setLlmModel(meta.promptLlmModel);
+    if (meta?.promptLlmApiKey) setLlmApiKey(meta.promptLlmApiKey);
+  }, [robot]);
+
+  const findScrapeListLimits = (workflow: WhereWhatPair[]) => {
+    const limits: ScrapeListLimit[] = [];
+
+    workflow.forEach((pair, pairIndex) => {
+      if (!pair.what) return;
+
+      pair.what.forEach((action, actionIndex) => {
+        if (
+          action.action === "scrapeList" &&
+          action.args &&
+          action.args.length > 0
+        ) {
+          const arg = action.args[0];
+          if (arg && typeof arg === "object" && "limit" in arg) {
+            limits.push({
+              pairIndex,
+              actionIndex,
+              argIndex: 0,
+              currentLimit: arg.limit,
+            });
+          }
+        }
+      });
+    });
+
+    setScrapeListLimits(limits);
+  };
+
+  const extractCrawlConfig = (workflow: WhereWhatPair[]) => {
+    workflow.forEach((pair) => {
+      if (!pair.what) return;
+
+      pair.what.forEach((action: any) => {
+        if (action.action === "crawl" && action.args && action.args.length > 0) {
+          const config = action.args[0];
+          if (config && typeof config === "object") {
+            setCrawlConfig(config as CrawlConfig);
+          }
+        }
+      });
+    });
+  };
+
+  const extractSearchConfig = (workflow: WhereWhatPair[]) => {
+    workflow.forEach((pair) => {
+      if (!pair.what) return;
+
+      pair.what.forEach((action: any) => {
+        if (action.action === "search" && action.args && action.args.length > 0) {
+          const config = action.args[0];
+          if (config && typeof config === "object") {
+            setSearchConfig(config as SearchConfig);
+          }
+        }
+      });
+    });
+  };
+
+  function extractInitialCredentials(workflow: any[]): Credentials {
+    const credentials: Credentials = {};
+
+    const isPrintableCharacter = (char: string): boolean => {
+      return char.length === 1 && !!char.match(/^[\x20-\x7E]$/);
+    };
+
+    workflow.forEach((step) => {
+      if (!step.what) return;
+
+      let currentSelector = "";
+      let currentValue = "";
+      let currentType = "";
+      let i = 0;
+
+      while (i < step.what.length) {
+        const action = step.what[i];
+
+        if (!action.action || !action.args?.[0]) {
+          i++;
+          continue;
+        }
+
+        const selector = action.args[0];
+
+        if (
+          action.action === "type" &&
+          action.args?.length >= 2 &&
+          typeof action.args[1] === "string" &&
+          action.args[1].length > 1
+        ) {
+          if (!credentials[selector]) {
+            credentials[selector] = {
+              value: action.args[1],
+              type: action.args[2] || "text",
+            };
+          }
+          i++;
+          continue;
+        }
+
+        if (
+          (action.action === "type" || action.action === "press") &&
+          action.args?.length >= 2 &&
+          typeof action.args[1] === "string"
+        ) {
+          if (selector !== currentSelector) {
+            if (currentSelector && currentValue) {
+              credentials[currentSelector] = {
+                value: currentValue,
+                type: currentType || "text",
+              };
+            }
+            currentSelector = selector;
+            currentValue = credentials[selector]?.value || "";
+            currentType =
+              action.args[2] || credentials[selector]?.type || "text";
+          }
+
+          const character = action.args[1];
+
+          if (isPrintableCharacter(character)) {
+            currentValue += character;
+          } else if (character === "Backspace") {
+            currentValue = currentValue.slice(0, -1);
+          }
+
+          if (!currentType && action.args[2]?.toLowerCase() === "password") {
+            currentType = "password";
+          }
+
+          let j = i + 1;
+          while (j < step.what.length) {
+            const nextAction = step.what[j];
+            if (
+              !nextAction.action ||
+              !nextAction.args?.[0] ||
+              nextAction.args[0] !== selector ||
+              (nextAction.action !== "type" && nextAction.action !== "press")
+            ) {
+              break;
+            }
+            if (nextAction.args[1] === "Backspace") {
+              currentValue = currentValue.slice(0, -1);
+            } else if (isPrintableCharacter(nextAction.args[1])) {
+              currentValue += nextAction.args[1];
+            }
+            j++;
+          }
+
+          credentials[currentSelector] = {
+            value: currentValue,
+            type: currentType,
+          };
+
+          i = j;
+        } else {
+          i++;
+        }
+      }
+
+      if (currentSelector && currentValue) {
+        credentials[currentSelector] = {
+          value: currentValue,
+          type: currentType || "text",
+        };
+      }
+    });
+
+    return credentials;
+  }
+
+  const groupCredentialsByType = (
+    credentials: Credentials
+  ): GroupedCredentials => {
+    return Object.entries(credentials).reduce(
+      (acc: GroupedCredentials, [selector, info]) => {
+        const credentialType = determineCredentialType(selector, info);
+
+        switch (credentialType) {
+          case "password":
+            acc.passwords.push(selector);
+            break;
+          case "email":
+            acc.emails.push(selector);
+            break;
+          case "username":
+            acc.usernames.push(selector);
+            break;
+          default:
+            acc.others.push(selector);
+        }
+
+        return acc;
+      },
+      { passwords: [], emails: [], usernames: [], others: [] }
+    );
+  };
+
+  const getRobot = async () => {
+    if (recordingId) {
+      try {
+        const robot = await getStoredRecording(recordingId);
+        setRobot(robot);
+      } catch (error) {
+        notify("error", t("robot_edit.notifications.update_failed"));
+      }
+    } else {
+      notify("error", t("robot_edit.notifications.update_failed"));
+    }
+  };
+
+  const handleClickShowPassword = (selector: string) => {
+    setShowPasswords((prev) => ({
+      ...prev,
+      [selector]: !prev[selector],
+    }));
+  };
+
+  const handleRobotNameChange = (newName: string) => {
+    setRobot((prev) =>
+      prev
+        ? { ...prev, recording_meta: { ...prev.recording_meta, name: newName } }
+        : prev
+    );
+  };
+
+  const handleCredentialChange = (selector: string, value: string) => {
+    setCredentials((prev) => ({
+      ...prev,
+      [selector]: {
+        ...prev[selector],
+        value,
+      },
+    }));
+  };
+
+  const handleLimitChange = (
+    pairIndex: number,
+    actionIndex: number,
+    argIndex: number,
+    newLimit: number
+  ) => {
+    setRobot((prev) => {
+      if (!prev) return prev;
+
+      const updatedWorkflow = [...prev.recording.workflow];
+      const pair = updatedWorkflow[pairIndex];
+      const action = pair?.what?.[actionIndex];
+      if (
+        updatedWorkflow.length > pairIndex &&
+        pair?.what &&
+        pair.what.length > actionIndex &&
+        action?.args &&
+        action.args.length > argIndex
+      ) {
+        if (action.args[argIndex]) {
+          action.args[argIndex].limit = newLimit;
+        }
+
+        setScrapeListLimits((prev) => {
+          return prev.map((item) => {
+            if (
+              item.pairIndex === pairIndex &&
+              item.actionIndex === actionIndex &&
+              item.argIndex === argIndex
+            ) {
+              return { ...item, currentLimit: newLimit };
+            }
+            return item;
+          });
+        });
+      }
+
+      return {
+        ...prev,
+        recording: { ...prev.recording, workflow: updatedWorkflow },
+      };
+    });
+  };
+
+  const handleActionNameChange = (
+    pairIndex: number,
+    actionIndex: number,
+    newName: string
+  ) => {
+    setRobot((prev) => {
+      if (!prev) return prev;
+
+      const updatedWorkflow = [...prev.recording.workflow];
+      if (
+        updatedWorkflow.length > pairIndex &&
+        updatedWorkflow[pairIndex]?.what &&
+        updatedWorkflow[pairIndex].what.length > actionIndex
+      ) {
+        const action = { ...updatedWorkflow[pairIndex].what[actionIndex] };
+        action.name = newName;
+
+        updatedWorkflow[pairIndex].what[actionIndex] = action;
+      }
+
+      return {
+        ...prev,
+        recording: { ...prev.recording, workflow: updatedWorkflow },
+      };
+    });
+  };
+
+  const normalizeUrl = (rawUrl: string): string => {
+    const trimmed = rawUrl.trim();
+    if (!trimmed) return trimmed;
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return trimmed;
+    if (/^[a-z][a-z0-9+.-]*\/\/\//i.test(trimmed)) return trimmed;
+    return `https://${trimmed}`;
+  };
+
+  const isNavigableUrl = (rawUrl: string): boolean => {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+      return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i.test(parsed.hostname)
+        || parsed.hostname === 'localhost'
+        || /^\d{1,3}(\.\d{1,3}){3}$/.test(parsed.hostname)
+        || /^\[[0-9a-f:]+\]$/i.test(parsed.hostname);
+    } catch {
+      return false;
+    }
+  };
+
+  const handleTargetUrlChange = (newUrl: string) => {
+    setRobot((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        recording_meta: { ...prev.recording_meta, url: newUrl },
+      };
+    });
+  };
+
+  const handleTargetUrlBlur = () => {
+    const current = getTargetUrl() || '';
+    handleTargetUrlChange(normalizeUrl(current));
+  };
+
+  const renderAllCredentialFields = () => {
+    return (
+      <>
+        {renderCredentialFields(
+          credentialGroups.usernames,
+          t("Username")
+        )}
+
+        {renderCredentialFields(credentialGroups.emails, t("Email"))}
+
+        {renderCredentialFields(
+          credentialGroups.passwords,
+          t("Password")
+        )}
+
+        {renderCredentialFields(credentialGroups.others, t("Other"))}
+      </>
+    );
+  };
+
+  const renderScrapeListLimitFields = () => {
+    if (scrapeListLimits.length === 0) return null;
+
+    return (
+      <>
+        <Typography variant="h6" style={{ marginBottom: "20px", marginTop: "20px" }}>
+          {t("List Limits")}
+        </Typography>
+
+        {scrapeListLimits.map((limitInfo, index) => {
+          const scrapeListAction = robot?.recording?.workflow?.[limitInfo.pairIndex]?.what?.[limitInfo.actionIndex];
+          const actionName =
+            scrapeListAction?.name ||
+            `List Limit ${index + 1}`;
+
+          return (
+            <TextField
+              key={`limit-${limitInfo.pairIndex}-${limitInfo.actionIndex}`}
+              label={actionName}
+              type="number"
+              value={limitInfo.currentLimit || ""}
+              onChange={(e) => {
+                const value = parseInt(e.target.value, 10);
+                if (value >= 1) {
+                  handleLimitChange(
+                    limitInfo.pairIndex,
+                    limitInfo.actionIndex,
+                    limitInfo.argIndex,
+                    value
+                  );
+                }
+              }}
+              inputProps={{ min: 1 }}
+              style={{ marginBottom: "20px" }}
+            />
+          );
+        })}
+      </>
+    );
+  };
+
+  const renderActionNameFields = () => {
+    if (!robot || !robot.recording || !robot.recording.workflow) return null;
+
+    const editableActions = new Set(['screenshot', 'scrapeList', 'scrapeSchema']);
+    const textInputs: JSX.Element[] = [];
+    const screenshotInputs: JSX.Element[] = [];
+    const listInputs: JSX.Element[] = [];
+
+    let screenshotCount = 0;
+    let listCount = 0;
+
+    robot.recording.workflow.forEach((pair, pairIndex) => {
+      if (!pair.what) return;
+
+      pair.what.forEach((action, actionIndex) => {
+        if (!editableActions.has(String(action.action))) return;
+
+        let currentName = action.name || '';
+
+        if (!currentName) {
+          switch (action.action) {
+            case 'scrapeSchema':
+              currentName = 'Texts';
+              break;
+            case 'screenshot':
+              screenshotCount++;
+              currentName = `Screenshot ${screenshotCount}`;
+              break;
+            case 'scrapeList':
+              listCount++;
+              currentName = `List ${listCount}`;
+              break;
+          }
+        } else {
+          switch (action.action) {
+            case 'screenshot':
+              screenshotCount++;
+              break;
+            case 'scrapeList':
+              listCount++;
+              break;
+          }
+        }
+
+        const textField = (
+          <TextField
+            key={`action-name-${pairIndex}-${actionIndex}`}
+            type="text"
+            value={currentName}
+            onChange={(e) => handleActionNameChange(pairIndex, actionIndex, e.target.value)}
+            style={{ marginBottom: '12px' }}
+            fullWidth
+          />
+        );
+
+        switch (action.action) {
+          case 'scrapeSchema': {
+            const existingName = currentName || "Texts";
+
+            if (!textInputs.length) {
+              textInputs.push(
+                <TextField
+                  key={`schema-${pairIndex}-${actionIndex}`}
+                  type="text"
+                  value={existingName}
+                  onChange={(e) => {
+                    const newName = e.target.value;
+
+                    setRobot((prev) => {
+                      if (!prev?.recording?.workflow) return prev;
+
+                      const updated = { ...prev };
+                      updated.recording = { ...prev.recording };
+                      updated.recording.workflow = prev.recording.workflow.map((p) => ({
+                        ...p,
+                        what: p.what?.map((a) => {
+                          if (a.action === "scrapeSchema") {
+                            const updatedAction = { ...a };
+                            updatedAction.name = newName;
+                            return updatedAction;
+                          }
+                          return a;
+                        }),
+                      }));
+
+                      return updated;
+                    });
+                  }}
+                  style={{ marginBottom: "12px" }}
+                  fullWidth
+                />
+              );
+            }
+
+            break;
+          }
+          case 'screenshot':
+            screenshotInputs.push(textField);
+            break;
+          case 'scrapeList':
+            listInputs.push(textField);
+            break;
+        }
+      });
+    });
+
+    const hasAnyInputs = textInputs.length > 0 || screenshotInputs.length > 0 || listInputs.length > 0;
+    if (!hasAnyInputs) return null;
+
+    return (
+      <>
+        <Typography variant="h6" style={{ marginBottom: '20px', marginTop: '20px' }}>
+          {t('Actions')}
+        </Typography>
+
+        {textInputs.length > 0 && (
+          <>
+            <Typography variant="subtitle1" style={{ marginBottom: '8px' }}>
+              Texts
+            </Typography>
+            {textInputs}
+          </>
+        )}
+
+        {screenshotInputs.length > 0 && (
+          <>
+            <Typography variant="subtitle1" style={{ marginBottom: '8px', marginTop: textInputs.length > 0 ? '16px' : '0' }}>
+              Screenshots
+            </Typography>
+            {screenshotInputs}
+          </>
+        )}
+
+        {listInputs.length > 0 && (
+          <>
+            <Typography variant="subtitle1" style={{ marginBottom: '8px', marginTop: (textInputs.length > 0 || screenshotInputs.length > 0) ? '16px' : '0' }}>
+              Lists
+            </Typography>
+            {listInputs}
+          </>
+        )}
+      </>
+    );
+  };
+
+  const renderCredentialFields = (
+    selectors: string[],
+    headerText: string,
+  ) => {
+    if (selectors.length === 0) return null;
+
+    return (
+      <>
+        {selectors.map((selector, index) => {
+          const isVisible = showPasswords[selector];
+
+          return (
+            <TextField
+              key={selector}
+              type={isVisible ? "text" : "password"}
+              label={
+                headerText === "Other" ? `${`Input`} ${index + 1}` : headerText
+              }
+              value={credentials[selector]?.value || ""}
+              onChange={(e) => handleCredentialChange(selector, e.target.value)}
+              fullWidth
+              style={{ marginBottom: "20px" }}
+              InputProps={{
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      aria-label="Show input"
+                      onClick={() => handleClickShowPassword(selector)}
+                      edge="end"
+                      disabled={!credentials[selector]?.value}
+                    >
+                      {isVisible ? <Visibility /> : <VisibilityOff />}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              }}
+            />
+          );
+        })}
+      </>
+    );
+  };
+
+  const getTargetUrl = () => {
+    let url = robot?.recording_meta.url;
+
+    if (!url) {
+      const lastPair =
+        robot?.recording.workflow[robot?.recording.workflow.length - 1];
+      url = lastPair?.what.find((action) => action.action === "goto")
+        ?.args?.[0];
+    }
+
+    return url;
+  };
+
+  const renderCrawlConfigFields = () => {
+    if (robot?.recording_meta.type !== 'crawl') return null;
+
+    return (
+      <>
+        <FormControl fullWidth sx={{ mb: 2 }}>
+          <InputLabel id="crawl-edit-output-formats-label">Output Formats *</InputLabel>
+          <Select
+            labelId="crawl-edit-output-formats-label"
+            multiple
+            value={crawlOutputFormats}
+            label="Output Formats *"
+            onChange={(e) => {
+              const value = typeof e.target.value === 'string' ? e.target.value.split(',') : e.target.value;
+              setCrawlOutputFormats(value as OutputFormats[]);
+            }}
+            renderValue={(selected) => {
+              const labels = (selected as OutputFormats[]).map(v => OUTPUT_FORMAT_LABELS[v] ?? v);
+              return labels.length > 2 ? `${labels.slice(0, 2).join(', ')}...` : labels.join(', ');
+            }}
+          >
+            {OUTPUT_FORMAT_OPTIONS.map((format) => (
+              <MenuItem key={format} value={format}>
+                <Checkbox checked={crawlOutputFormats.includes(format)} />
+                {OUTPUT_FORMAT_LABELS[format]}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <TextField
+          label="Max Pages to Crawl"
+          type="number"
+          fullWidth
+          value={crawlConfig.limit || 10}
+          onChange={(e) => {
+            const value = parseInt(e.target.value, 10);
+            if (value >= 1) {
+              setCrawlConfig((prev) => ({ ...prev, limit: value }));
+            }
+          }}
+          inputProps={{ min: 1 }}
+          style={{ marginBottom: "20px" }}
+        />
+
+        <Button
+          onClick={() => setShowCrawlAdvanced(!showCrawlAdvanced)}
+          sx={{
+            color: theme => theme.palette.mode === 'dark' ? 'inherit' : theme.palette.common.black,
+            textTransform: 'none',
+            alignSelf: 'flex-start',
+            '&:hover': {
+              background: 'inherit',
+              color: 'inherit',
+            },
+          }}
+        >
+          {showCrawlAdvanced ? 'Hide Crawl Settings' : 'Crawl Settings'}
+        </Button>
+
+        <Collapse in={showCrawlAdvanced}>
+          <Box sx={{ mt: 4, mb: 2 }}>
+            <FormControl fullWidth sx={{ mb: 2 }}>
+              <InputLabel>Crawl Scope</InputLabel>
+              <Select
+                value={crawlConfig.mode || 'domain'}
+                label="Crawl Scope"
+                onChange={(e) =>
+                  setCrawlConfig((prev) => ({
+                    ...prev,
+                    mode: e.target.value,
+                  }))
+                }
+              >
+                <MenuItem value="domain">Same Domain Only</MenuItem>
+                <MenuItem value="subdomain">Include Subdomains</MenuItem>
+                <MenuItem value="path">Specific Path Only</MenuItem>
+              </Select>
+            </FormControl>
+
+            <TextField
+              label="Max Depth"
+              type="number"
+              fullWidth
+              value={crawlConfig.maxDepth || 3}
+              onChange={(e) => {
+                const value = parseInt(e.target.value, 10);
+                if (value >= 1) {
+                  setCrawlConfig((prev) => ({ ...prev, maxDepth: value }));
+                }
+              }}
+              inputProps={{ min: 1 }}
+              sx={{ mb: 2 }}
+              helperText="How many links deep to follow (default: 3)"
+            />
+
+            <TextField
+              label="Include Paths"
+              placeholder="Example: /products, /blog"
+              fullWidth
+              value={crawlConfig.includePaths?.join(', ') || ''}
+              onChange={(e) => {
+                const paths = e.target.value ? e.target.value.split(',').map(p => p.trim()) : [];
+                setCrawlConfig((prev) => ({ ...prev, includePaths: paths }));
+              }}
+              sx={{ mb: 2 }}
+              helperText="Only crawl URLs matching these paths (comma-separated)"
+            />
+
+            <TextField
+              label="Exclude Paths"
+              placeholder="Example: /admin, /login"
+              fullWidth
+              value={crawlConfig.excludePaths?.join(', ') || ''}
+              onChange={(e) => {
+                const paths = e.target.value ? e.target.value.split(',').map(p => p.trim()) : [];
+                setCrawlConfig((prev) => ({ ...prev, excludePaths: paths }));
+              }}
+              sx={{ mb: 2 }}
+              helperText="Skip URLs matching these paths (comma-separated)"
+            />
+
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={crawlConfig.useSitemap ?? true}
+                    onChange={(e) => setCrawlConfig((prev) => ({ ...prev, useSitemap: e.target.checked }))}
+                  />
+                }
+                label="Use sitemap.xml for URL discovery"
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={crawlConfig.followLinks ?? true}
+                    onChange={(e) => setCrawlConfig((prev) => ({ ...prev, followLinks: e.target.checked }))}
+                  />
+                }
+                label="Follow links on pages"
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={crawlConfig.respectRobots ?? true}
+                    onChange={(e) => setCrawlConfig((prev) => ({ ...prev, respectRobots: e.target.checked }))}
+                  />
+                }
+                label="Respect robots.txt"
+              />
+            </Box>
+          </Box>
+        </Collapse>
+
+        {renderLlmConfigFields()}
+      </>
+    );
+  };
+
+  const renderSearchConfigFields = () => {
+    if (robot?.recording_meta.type !== 'search') return null;
+
+    const currentSearchMode = searchConfig.mode || 'discover';
+
+    return (
+      <>
+        <TextField
+          label="Search Query"
+          placeholder="Example: latest AI breakthroughs 2025"
+          fullWidth
+          value={searchConfig.query || ''}
+          onChange={(e) => {
+            setSearchConfig((prev) => ({ ...prev, query: e.target.value }));
+          }}
+          sx={{ mb: 2 }}
+        />
+
+        <TextField
+          label="Number of Results"
+          type="number"
+          fullWidth
+          value={searchConfig.limit || 10}
+          onChange={(e) => {
+            const value = parseInt(e.target.value, 10);
+            if (value >= 1) {
+              setSearchConfig((prev) => ({ ...prev, limit: value }));
+            }
+          }}
+          inputProps={{ min: 1 }}
+          sx={{ mb: 2 }}
+        />
+
+        <FormControl fullWidth sx={{ mb: 2 }}>
+          <InputLabel>Mode</InputLabel>
+          <Select
+            value={searchConfig.mode || 'discover'}
+            label="Mode"
+            onChange={(e) => {
+              const newMode = e.target.value as 'discover' | 'scrape';
+              setSearchConfig((prev) => ({ ...prev, mode: newMode }));
+              if (newMode === 'discover') {
+                setSearchOutputFormats([]);
+              } else if (searchOutputFormats.length === 0) {
+                setSearchOutputFormats(DEFAULT_OUTPUT_FORMATS);
+              }
+            }}
+          >
+            <MenuItem value="discover">Discover URLs Only</MenuItem>
+            <MenuItem value="scrape">Extract Data from Results</MenuItem>
+          </Select>
+        </FormControl>
+
+        {currentSearchMode === 'scrape' ? (
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel id="search-edit-output-formats-label">Output Formats *</InputLabel>
+            <Select
+              labelId="search-edit-output-formats-label"
+              multiple
+              value={searchOutputFormats}
+              label="Output Formats *"
+              onChange={(e) => {
+                const value = typeof e.target.value === 'string' ? e.target.value.split(',') : e.target.value;
+                setSearchOutputFormats(value as OutputFormats[]);
+              }}
+              renderValue={(selected) => {
+                const labels = (selected as OutputFormats[]).map(v => OUTPUT_FORMAT_LABELS[v] ?? v);
+                return labels.length > 2 ? `${labels.slice(0, 2).join(', ')}...` : labels.join(', ');
+              }}
+            >
+              {OUTPUT_FORMAT_OPTIONS.map((format) => (
+                <MenuItem key={format} value={format}>
+                  <Checkbox checked={searchOutputFormats.includes(format)} />
+                  {OUTPUT_FORMAT_LABELS[format]}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        ) : (
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Output formats are only available in "Extract Data from Results" mode
+          </Typography>
+        )}
+
+        <FormControl fullWidth sx={{ mb: 2 }}>
+          <InputLabel>Time Range</InputLabel>
+          <Select
+            value={searchConfig.filters?.timeRange || ''}
+            label="Time Range"
+            displayEmpty
+            renderValue={(value) => {
+              if (!value) {
+                return 'All Time';
+              }
+              const timeRange = value as 'day' | 'week' | 'month' | 'year';
+              return {
+                day: 'Past 24 Hours',
+                week: 'Past Week',
+                month: 'Past Month',
+                year: 'Past Year',
+              }[timeRange];
+            }}
+            onChange={(e) =>
+              setSearchConfig((prev) => ({
+                ...prev,
+                filters: {
+                  ...prev.filters,
+                  timeRange: e.target.value as
+                    | ''
+                    | 'day'
+                    | 'week'
+                    | 'month'
+                    | 'year'
+                    | undefined,
+                },
+              }))
+            }
+          >
+            <MenuItem value="">All Time</MenuItem>
+            <MenuItem value="day">Past 24 Hours</MenuItem>
+            <MenuItem value="week">Past Week</MenuItem>
+            <MenuItem value="month">Past Month</MenuItem>
+            <MenuItem value="year">Past Year</MenuItem>
+          </Select>
+        </FormControl>
+
+        {renderLlmConfigFields()}
+      </>
+    );
+  };
+
+  const renderScrapeOutputFormatsField = () => {
+    const robotType = robot?.recording_meta.type;
+    if (robotType !== 'scrape') return null;
+
+    return (
+      <FormControl fullWidth sx={{ mb: 2 }}>
+        <InputLabel id="scrape-edit-output-formats-label">Output Formats *</InputLabel>
+        <Select
+          labelId="scrape-edit-output-formats-label"
+          multiple
+          value={scrapeOutputFormats}
+          label="Output Formats *"
+          onChange={(e) => {
+            const value = typeof e.target.value === 'string' ? e.target.value.split(',') : e.target.value;
+            setScrapeOutputFormats(value as OutputFormats[]);
+          }}
+          renderValue={(selected) => {
+            const labels = (selected as OutputFormats[]).map(v => OUTPUT_FORMAT_LABELS[v] ?? v);
+            return labels.length > 2 ? `${labels.slice(0, 2).join(', ')}...` : labels.join(', ');
+          }}
+        >
+          {OUTPUT_FORMAT_OPTIONS.map((format) => (
+            <MenuItem key={format} value={format}>
+              <Checkbox checked={scrapeOutputFormats.includes(format)} />
+              {OUTPUT_FORMAT_LABELS[format]}
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+    );
+  };
+
+  const handleReplaceDocument = async () => {
+    if (!robot || !replacementFile) return;
+    setIsReplacingFile(true);
+    const result = await replaceDocumentFile(robot.recording_meta.id, replacementFile);
+    setIsReplacingFile(false);
+    if (result?.error) {
+      notify('error', result.error);
+    } else {
+      notify('success', `Document replaced: ${replacementFile.name}`);
+      setReplacementFile(null);
+      getRobot();
+    }
+  };
+
+  const renderDocumentFileSection = () => {
+    const robotType = robot?.recording_meta.type;
+    if (robotType !== 'doc-extract' && robotType !== 'doc-parse') return null;
+
+    const currentFileName = (robot?.recording as any)?.documentFileName || 'Unknown file';
+
+    return (
+      <>
+        <Divider sx={{ my: 2 }} />
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          Current file: <strong>{currentFileName}</strong>
+        </Typography>
+        <Box
+          sx={{
+            border: '2px dashed',
+            borderColor: 'rgba(52, 51, 52, 0.43)',
+            borderRadius: 2,
+            p: 3,
+            mb: 2,
+            textAlign: 'center',
+            cursor: 'pointer',
+          }}
+          onClick={() => document.getElementById('doc-replace-input')?.click()}
+        >
+          <input
+            id="doc-replace-input"
+            type="file"
+            accept=".pdf,.docx,.csv,.xlsx,.jpg,.jpeg,.png,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/jpeg,image/png"
+            style={{ display: 'none' }}
+            onChange={(e) => setReplacementFile(e.target.files?.[0] || null)}
+          />
+          {replacementFile ? (
+            <Typography variant="body2" fontWeight={500}>
+              📄 {replacementFile.name}
+            </Typography>
+          ) : (
+            <>
+              <Typography variant="body2" fontWeight={500}>Click to upload a new PDF, DOCX, XLSX, CSV, JPG, or PNG</Typography>
+              <Typography variant="caption" color="text.secondary">Max file size: 10 MB</Typography>
+            </>
+          )}
+        </Box>
+        <Button
+          variant="outlined"
+          disabled={!replacementFile || isReplacingFile}
+          onClick={handleReplaceDocument}
+          sx={{
+            borderColor: 'divider',
+            color: 'text.primary',
+            textTransform: 'none',
+            '&:hover': { borderColor: 'divider' },
+          }}
+          startIcon={isReplacingFile ? <CircularProgress size={16} color="inherit" /> : null}
+        >
+          {isReplacingFile ? 'Replacing...' : 'Replace Document'}
+        </Button>
+      </>
+    );
+  };
+
+  const shouldShowLlmConfig = () => {
+    const type = robot?.recording_meta?.type;
+    if (!type) return false;
+    if (robot?.recording_meta?.isLLM) return true;
+    if (type === 'scrape' && (robot?.recording_meta?.promptInstructions || scrapeOutputFormats.includes('summary' as OutputFormats))) return true;
+    if (type === 'crawl') return crawlOutputFormats.includes('summary' as OutputFormats);
+    if (type === 'search') return searchOutputFormats.includes('summary' as OutputFormats);
+    return false;
+  };
+
+  const renderLlmConfigFields = () => {
+    if (!shouldShowLlmConfig()) return null;
+
+    const preset = getPreset(llmOpenAIPreset);
+
+    return (
+      <>
+        <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+          <FormControl sx={{ flex: 1 }}>
+            <InputLabel>LLM Provider</InputLabel>
+            <Select
+              value={llmProvider}
+              label="LLM Provider"
+              onChange={(e) => {
+                const p = e.target.value as LlmProvider;
+                setLlmProvider(p);
+                setLlmModel('');
+                setLlmApiKey('');
+                if (p === 'ollama') setLlmBaseUrl('');
+                else if (p === 'openai') setLlmBaseUrl(getPreset(llmOpenAIPreset).baseUrl);
+                else setLlmBaseUrl('');
+              }}
+            >
+              <MenuItem value="ollama">Ollama (Local)</MenuItem>
+              <MenuItem value="anthropic">Anthropic (Claude)</MenuItem>
+              <MenuItem value="openai">OpenAI-compatible</MenuItem>
+            </Select>
+          </FormControl>
+
+          <TextField
+            sx={{ flex: 1 }}
+            value={llmModel}
+            label="Model"
+            placeholder={getModelPlaceholder(llmProvider, llmOpenAIPreset)}
+            helperText={getModelHelperText(llmProvider, llmOpenAIPreset)}
+            onChange={(e) => setLlmModel(e.target.value)}
+            FormHelperTextProps={{ sx: { ml: 0.5 } }}
+          />
+        </Box>
+
+        {llmProvider === 'openai' && (
+          <>
+            <FormControl fullWidth sx={{ mb: 2 }}>
+              <InputLabel>OpenAI-compatible Preset</InputLabel>
+              <Select
+                value={llmOpenAIPreset}
+                label="OpenAI-compatible Preset"
+                onChange={(e) => {
+                  const id = e.target.value as OpenAICompatiblePresetId;
+                  setLlmOpenAIPreset(id);
+                  setLlmModel('');
+                  setLlmBaseUrl(getPreset(id).baseUrl);
+                  setLlmApiKey('');
+                }}
+              >
+                {OPENAI_COMPATIBLE_PRESET_IDS.map((id) => (
+                  <MenuItem key={id} value={id}>{OPENAI_COMPATIBLE_PRESETS[id].label}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            <TextField
+              placeholder={preset.baseUrlPlaceholder}
+              fullWidth
+              value={llmBaseUrl}
+              onChange={(e) => setLlmBaseUrl(e.target.value)}
+              label="Base URL"
+              helperText={preset.baseUrlHelperText}
+              sx={{ mb: 2 }}
+              FormHelperTextProps={{ sx: { ml: 0.5 } }}
+            />
+
+            <TextField
+              placeholder={preset.apiKeyPlaceholder}
+              fullWidth
+              type={showLlmApiKey ? 'text' : 'password'}
+              value={llmApiKey}
+              onChange={(e) => setLlmApiKey(e.target.value)}
+              label="API Key"
+              helperText={preset.apiKeyHelperText}
+              sx={{ mb: 2 }}
+              FormHelperTextProps={{ sx: { ml: 0.5 } }}
+              InputProps={{
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton onClick={() => setShowLlmApiKey(p => !p)} edge="end">
+                      {showLlmApiKey ? <Visibility /> : <VisibilityOff />}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              }}
+            />
+          </>
+        )}
+
+        {llmProvider === 'anthropic' && (
+          <TextField
+            placeholder="Anthropic API key"
+            fullWidth
+            type={showLlmApiKey ? 'text' : 'password'}
+            value={llmApiKey}
+            onChange={(e) => setLlmApiKey(e.target.value)}
+            label="API Key (Optional if set in .env)"
+            sx={{ mb: 2 }}
+            InputProps={{
+              endAdornment: (
+                <InputAdornment position="end">
+                  <IconButton onClick={() => setShowLlmApiKey(p => !p)} edge="end">
+                    {showLlmApiKey ? <Visibility /> : <VisibilityOff />}
+                  </IconButton>
+                </InputAdornment>
+              ),
+            }}
+          />
+        )}
+
+        {llmProvider === 'ollama' && (
+          <TextField
+            placeholder={OLLAMA_DEFAULT_BASE_URL}
+            fullWidth
+            value={llmBaseUrl}
+            onChange={(e) => setLlmBaseUrl(e.target.value)}
+            label="Ollama Base URL (Optional)"
+            helperText={OLLAMA_DOCKER_HINT}
+            sx={{ mb: 2 }}
+            FormHelperTextProps={{ sx: { ml: 0.5 } }}
+          />
+        )}
+      </>
+    );
+  };
+
+  const handleSave = async () => {
+    if (!robot) return;
+
+    const targetUrlValue = getTargetUrl();
+    const robotType = robot.recording_meta.type;
+    const hasEditableTargetUrl = !robot.recording_meta.type?.includes("prebuilt") &&
+      robotType !== 'search' && robotType !== 'doc-extract' && robotType !== 'doc-parse' &&
+      robot.recording_meta.isLLM !== true;
+    if (hasEditableTargetUrl && targetUrlValue && !isNavigableUrl(normalizeUrl(targetUrlValue))) {
+      notify("error", t("robot_edit.notifications.invalid_url", "Please enter a valid website URL (e.g. https://example.com)"));
+      return;
+    }
+
+    if (robot.recording_meta.type === 'crawl' && crawlOutputFormats.length === 0) {
+      notify("error", "Please select at least one output format");
+      return;
+    }
+
+    if (
+      robot.recording_meta.type === 'search' &&
+      (searchConfig.mode || 'discover') === 'scrape' &&
+      searchOutputFormats.length === 0
+    ) {
+      notify("error", "Please select at least one output format");
+      return;
+    }
+
+    if (shouldShowLlmConfig() && llmProvider !== 'ollama' && !llmApiKey.trim()) {
+      const originalProvider = robot.recording_meta.promptLlmProvider;
+      const originalBaseUrl = robot.recording_meta.promptLlmBaseUrl || '';
+      const providerChanged = originalProvider !== llmProvider;
+      const baseUrlChanged = (llmBaseUrl || '') !== originalBaseUrl;
+      const previouslyHadNonOllamaKey = originalProvider && originalProvider !== 'ollama';
+      if (!previouslyHadNonOllamaKey || providerChanged || baseUrlChanged) {
+        notify("error", `An API key is required when using ${llmProvider === 'anthropic' ? 'Anthropic' : 'an OpenAI-compatible'} provider`);
+        return;
+      }
+    }
+
+    const type = robot.recording_meta.type;
+    if (type === 'scrape' && scrapeOutputFormats.length === 0) {
+      notify("error", "Please select at least one output format");
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const credentialsForPayload = Object.entries(credentials).reduce(
+        (acc, [selector, info]) => {
+          const enforceType = info.type === "password" ? "password" : "text";
+
+          acc[selector] = {
+            value: info.value,
+            type: enforceType,
+          };
+          return acc;
+        },
+        {} as Record<string, CredentialInfo>
+      );
+
+      const targetUrl = normalizeUrl(getTargetUrl() || '');
+
+      let updatedWorkflow = robot.recording.workflow;
+      if (robot.recording_meta.type === 'crawl') {
+        updatedWorkflow = updatedWorkflow.map((pair: any) => {
+          if (!pair.what) return pair;
+
+          return {
+            ...pair,
+            what: pair.what.map((action: any) => {
+              if (action.action === 'crawl') {
+                return {
+                  ...action,
+                  args: [{ ...crawlConfig }]
+                };
+              }
+              return action;
+            })
+          };
+        });
+      }
+
+      if (robot.recording_meta.type === 'search') {
+        updatedWorkflow = updatedWorkflow.map((pair: any) => {
+          if (!pair.what) return pair;
+
+          return {
+            ...pair,
+            what: pair.what.map((action: any) => {
+              if (action.action === 'search') {
+                return {
+                  ...action,
+                  args: [{
+                    ...searchConfig,
+                    provider: 'duckduckgo'
+                  }]
+                };
+              }
+              return action;
+            })
+          };
+        });
+      }
+
+      const payload: any = {
+        name: robot.recording_meta.name,
+        limits: scrapeListLimits.map((limit) => ({
+          pairIndex: limit.pairIndex,
+          actionIndex: limit.actionIndex,
+          argIndex: limit.argIndex,
+          limit: limit.currentLimit,
+        })),
+        credentials: credentialsForPayload,
+        targetUrl: targetUrl,
+        workflow: updatedWorkflow,
+        formats: robot.recording_meta.type === 'crawl'
+          ? crawlOutputFormats
+          : robot.recording_meta.type === 'search'
+            ? ((searchConfig.mode || 'discover') === 'discover' ? [] : searchOutputFormats)
+            : robot.recording_meta.type === 'scrape'
+              ? scrapeOutputFormats
+              : undefined,
+      };
+
+      if (shouldShowLlmConfig()) {
+        payload.promptLlmProvider = llmProvider;
+        payload.promptLlmModel = llmModel.trim() || undefined;
+        payload.promptLlmApiKey = llmApiKey || undefined;
+        payload.promptLlmBaseUrl = llmBaseUrl.trim() || undefined;
+      }
+
+      const success = await updateRecording(robot.recording_meta.id, payload);
+
+      if (success) {
+        invalidateRecordings();
+        setRerenderRobots(true);
+        notify("success", t("robot_edit.notifications.update_success"));
+        handleStart(robot);
+        const basePath = "/robots";
+        navigate(basePath);
+      } else {
+        notify("error", t("robot_edit.notifications.update_failed"));
+      }
+    } catch (error: any) {
+      if (error.isDuplicate) {
+        notify("error", t("save_recording.errors.name_exists"));
+      } else {
+        notify("error", error.message || t("robot_edit.notifications.update_error"));
+      }
+      console.error("Error updating robot:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCancel = () => {
+    const basePath = "/robots";
+    navigate(basePath);
+  };
+
+  // AI mode / Agent robots: target URL, list limits and actions are hidden here
+  // (UI only; the values stay on the robot and are saved unchanged).
+  const isAgentRobot = robot?.recording_meta?.isLLM === true;
+
+  return (
+    <RobotConfigPage
+      title={t("robot_edit.title")}
+      onSave={handleSave}
+      onCancel={handleCancel}
+      saveButtonText={t("robot_edit.save")}
+      cancelButtonText={t("robot_edit.cancel")}
+      showCancelButton={false}
+      isLoading={isLoading}
+    >
+      <>
+        <Box style={{ display: "flex", flexDirection: "column" }}>
+          {robot && (
+            <>
+              <TextField
+                label={t("robot_edit.change_name")}
+                key="Name"
+                type="text"
+                value={robot.recording_meta.name}
+                onChange={(e) => handleRobotNameChange(e.target.value)}
+                style={{ marginBottom: "20px" }}
+              />
+
+              {!['search', 'doc-parse', 'doc-extract'].includes(robot.recording_meta.type || '') && !isAgentRobot && (
+                <TextField
+                  label={t("robot_duplication.fields.target_url")}
+                  key={t("robot_duplication.fields.target_url")}
+                  value={getTargetUrl() || ""}
+                  onChange={(e) => handleTargetUrlChange(e.target.value)}
+                  onBlur={handleTargetUrlBlur}
+                  style={{ marginBottom: "20px" }}
+                />
+              )}
+
+              {renderCrawlConfigFields()}
+              {renderSearchConfigFields()}
+              {renderScrapeOutputFormatsField()}
+
+              {!isAgentRobot && renderScrapeListLimitFields()}
+              {!isAgentRobot && renderActionNameFields()}
+              {renderAllCredentialFields()}
+              {robot?.recording_meta?.type !== 'crawl' && robot?.recording_meta?.type !== 'search' && renderLlmConfigFields()}
+              {renderDocumentFileSection()}
+            </>
+          )}
+        </Box>
+      </>
+    </RobotConfigPage>
+  );
+};
